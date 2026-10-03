@@ -5,7 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DAY, nextDay, dayStart, dayKey, integrate, parseHistory, normalizeUrl } = require('./lib');
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT) || 8723;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const PUBLIC = path.join(__dirname, 'public');
@@ -41,7 +41,7 @@ function save() {
 
 /* ---------- Home Assistant ---------- */
 
-async function haFetch(url, token, p, timeoutMs = 30000) {
+async function haFetch(url, token, p, timeoutMs = 87230) {
   const res = await fetch(normalizeUrl(url) + p, {
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     signal: AbortSignal.timeout(timeoutMs),

@@ -4,7 +4,7 @@ services:
     container_name: stromrechner
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "8723:8723"
     environment:
       TZ: Europe/Berlin
     volumes:

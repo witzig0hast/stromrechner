@@ -9,7 +9,7 @@ für einen frei wählbaren Zeitraum berechnet und mit dem Gesamtverbrauch vergle
 docker compose up -d --build
 ```
 
-Dann `http://localhost:3000` öffnen. Daten liegen im Volume `/data` (`db.json`).
+Dann `http://localhost:8723` öffnen. Daten liegen im Volume `/data` (`db.json`).
 Zeitzone per `TZ` in `docker-compose.yml` anpassen.
 
 ## Einrichtung
