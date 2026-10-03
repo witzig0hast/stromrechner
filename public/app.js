@@ -139,7 +139,7 @@ function chart(days) {
 
 /* ---------------- Einstellungen ---------------- */
 async function settings() {
-  const [s, hist] = await Promise.all([api('/settings'), api('/history')]);
+  const [s, hist, al] = await Promise.all([api('/settings'), api('/history'), api('/alerts')]);
   app.innerHTML = `
     <div class="head"><h1>Einstellungen</h1>
     <p class="sub">Strompreis, Home-Assistant-Anbindung und frühere Verbrauchswerte verwalten.</p></div>
@@ -164,6 +164,31 @@ async function settings() {
       <div class="hint">Token erstellen: Home Assistant → Profil → Sicherheit → Langlebige Zugriffstoken. Der Verbrauch wird aus der Leistung (W) über die Zeit berechnet.</div>
       <div id="haStatus"></div></div>
     </section>
+
+    <section class="card"><div class="card-h"><div><h2>E-Mail-Benachrichtigung</h2><p>Warnt, wenn der Verbrauch gegenüber den Vortagen oder Vormonaten deutlich steigt, inklusive Ursachenanalyse. Versand per SMTP mit direktem TLS (Port 465).</p></div></div><div class="card-b">
+      <div class="grid g2">
+        <div><label for="sh">SMTP-Server</label><input id="sh" placeholder="smtp.example.com" value="${esc(s.smtpHost)}"></div>
+        <div><label for="sp">Port (direktes TLS)</label><input id="sp" inputmode="numeric" value="${s.smtpPort}"></div>
+        <div><label for="su">Benutzername</label><input id="su" autocomplete="off" value="${esc(s.smtpUser)}"></div>
+        <div><label for="spw">Passwort</label><input id="spw" type="password" autocomplete="new-password" placeholder="${s.hasSmtpPass ? '•••••••• gespeichert (leer lassen zum Behalten)' : 'Passwort'}"></div>
+        <div><label for="sf">Absender</label><input id="sf" placeholder="stromrechner@example.com" value="${esc(s.smtpFrom)}"></div>
+        <div><label for="st">Empfänger (mehrere mit Komma)</label><input id="st" placeholder="du@example.com" value="${esc(s.smtpTo)}"></div>
+      </div>
+      <label class="check"><input type="checkbox" id="sv" ${s.smtpVerify ? 'checked' : ''}> TLS-Zertifikat des Servers prüfen (nur bei selbstsigniertem Zertifikat abschalten)</label>
+      <div class="sep"></div>
+      <div class="grid g4">
+        <div><label for="at">Tägliche Prüfung um</label><input type="time" id="at" value="${esc(s.alertTime)}"></div>
+        <div><label for="ad">Schwelle Tag (+ %)</label><input id="ad" inputmode="decimal" value="${s.alertDayPct}"></div>
+        <div><label for="am">Schwelle Monat (+ %)</label><input id="am" inputmode="decimal" value="${s.alertMonthPct}"></div>
+        <div><label for="ak">Mindest-Mehrverbrauch (kWh/Tag)</label><input id="ak" inputmode="decimal" value="${s.alertMinKwh}"></div>
+      </div>
+      <label class="check"><input type="checkbox" id="ae" ${s.alertsEnabled ? 'checked' : ''}> Automatische tägliche Prüfung aktivieren (E-Mail nur bei Auffälligkeit)</label>
+      <div class="hint">Tag: gestern gegen den Durchschnitt der 7 Tage davor. Monat: laufender Monat (an den ersten beiden Tagen der Vormonat) gegen den Durchschnitt der 3 Monate davor.</div>
+      <div class="actions"><button class="btn" id="saveMail">Speichern</button><button class="btn ghost" id="testMail">Testmail senden</button><button class="btn ghost" id="checkNow">Jetzt prüfen (Vorschau)</button><button class="btn ghost" id="checkSend">Prüfen &amp; E-Mail senden</button></div>
+      ${al.state.lastError ? `<div class="msg err">Letzter automatischer Versand fehlgeschlagen: ${esc(al.state.lastError)}</div>` : ''}
+      <div id="mailStatus"></div>
+      ${al.log.length ? `<div class="tbl" style="margin-top:18px;max-height:280px"><table><thead><tr><th>Gesendet</th><th>Art</th><th>Zeitraum</th><th class="r">Abweichung</th></tr></thead><tbody>${al.log.map((a) => `<tr><td>${fmtDT(a.at)}</td><td>${a.kind === 'day' ? 'Tag' : 'Monat'}</td><td>${esc(a.label)}</td><td class="r">${a.deltaPct === null ? '–' : '+' + nf(a.deltaPct, 0) + ' %'}</td></tr>`).join('')}</tbody></table></div>` : ''}
+    </div></section>
 
     <section class="card"><div class="card-h"><div><h2>Frühere Ergebnisse</h2><p>Gesamtverbrauch vergangener Zeiträume, nutzbar als Vergleichswert.</p></div></div><div class="card-b">
       <div class="row">
@@ -194,6 +219,30 @@ async function settings() {
     const bad = Object.values(r.entities).some((v) => !v.ok);
     st.innerHTML = `<div class="msg ${bad ? 'err' : 'ok'}">Verbindung steht.${lines.length ? '<br>' + lines.join('<br>') : ''}</div>`;
   };
+  const mailBody = () => ({ smtpHost: $('#sh').value, smtpPort: $('#sp').value, smtpUser: $('#su').value, smtpPass: $('#spw').value, smtpFrom: $('#sf').value, smtpTo: $('#st').value, smtpVerify: $('#sv').checked });
+  const saveMail = () => api('/settings', { method: 'PUT', body: { ...mailBody(), alertsEnabled: $('#ae').checked, alertTime: $('#at').value, alertDayPct: $('#ad').value, alertMonthPct: $('#am').value, alertMinKwh: $('#ak').value } });
+  const ms = $('#mailStatus');
+  $('#saveMail').onclick = async () => { await saveMail(); $('#spw').value = ''; toast('Gespeichert'); };
+  $('#testMail').onclick = async () => {
+    ms.innerHTML = '<div class="msg ok"><span class="spin"></span>Sende Testmail …</div>';
+    const r = await api('/mail/test', { method: 'POST', body: mailBody() }).catch((e) => ({ ok: false, error: e.message }));
+    ms.innerHTML = r.ok ? '<div class="msg ok">Testmail wurde gesendet.</div>' : `<div class="msg err">${esc(r.error)}</div>`;
+  };
+  const runCheck = (send) => async () => {
+    await saveMail(); $('#spw').value = '';
+    ms.innerHTML = '<div class="msg ok"><span class="spin"></span>Prüfe Verbrauch …</div>';
+    try {
+      const r = await api('/alerts/check', { method: 'POST', body: { send } });
+      const st = { alert: ['err', 'Auffällig'], ok: ['ok', 'Unauffällig'], skipped: ['warn', 'Übersprungen'] };
+      let h = r.checks.map((c) => `<div class="msg ${st[c.status][0]}"><b>${esc(c.title)}: ${st[c.status][1]}</b><br>${c.current !== undefined ? `${esc(c.label)}: ${nf(c.current)} kWh/Tag · Vergleich ${nf(c.reference)} kWh/Tag (${esc(c.refLabel)}) · ${Number.isFinite(c.deltaPct) ? (c.deltaPct >= 0 ? '+' : '') + nf(c.deltaPct, 0) + ' %' : 'neu'}<br>` : ''}${esc(c.note)}</div>`).join('');
+      r.findings.forEach((f) => { h += `<div class="msg warn"><b>Mögliche Ursachen (${f.kind === 'day' ? 'Tag' : 'Monat'}):</b><ul style="margin:6px 0 0;padding-left:20px">${f.causes.map((c) => `<li>${esc(c)}</li>`).join('')}</ul></div>`; });
+      if (send) h += r.sent ? '<div class="msg ok">E-Mail wurde gesendet.</div>' : r.error ? `<div class="msg err">Versand fehlgeschlagen: ${esc(r.error)}</div>` : '<div class="msg ok">Keine Auffälligkeit – es wurde keine E-Mail gesendet.</div>';
+      ms.innerHTML = h;
+      if (r.sent) setTimeout(settings, 2500);
+    } catch (e) { ms.innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
+  };
+  $('#checkNow').onclick = runCheck(false);
+  $('#checkSend').onclick = runCheck(true);
   $('#addH').onclick = async () => {
     try {
       await api('/history', { method: 'POST', body: { label: $('#hl').value, from: $('#hf').value, to: $('#ht').value, kwh: $('#hk').value } });

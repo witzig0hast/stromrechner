@@ -3,6 +3,8 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { sendMail, parseAddrs } = require('./smtp');
+const { runChecks, buildAlertMail, buildTestMail, neededStart } = require('./alerts');
 const { DAY, nextDay, dayStart, dayKey, integrate, parseHistory, normalizeUrl } = require('./lib');
 
 const PORT = Number(process.env.PORT) || 8723;
@@ -22,15 +24,29 @@ const DEFAULTS = {
     entityCurrent: '',
     measureStart: '',
     measureEnd: '',
+    smtpHost: '',
+    smtpPort: 465,           // direktes TLS (SMTPS), kein STARTTLS
+    smtpUser: '',
+    smtpPass: '',
+    smtpFrom: '',
+    smtpTo: '',
+    smtpVerify: true,
+    alertsEnabled: false,
+    alertTime: '08:00',
+    alertDayPct: 30,
+    alertMonthPct: 25,
+    alertMinKwh: 0.2,
   },
   history: [],
+  alerts: [],
+  alertState: {},
 };
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 let db = structuredClone(DEFAULTS);
 try {
   const saved = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  db = { settings: { ...DEFAULTS.settings, ...saved.settings }, history: saved.history || [] };
+  db = { settings: { ...DEFAULTS.settings, ...saved.settings }, history: saved.history || [], alerts: saved.alerts || [], alertState: saved.alertState || {} };
 } catch { /* first start */ }
 
 function save() {
@@ -200,6 +216,76 @@ async function calculate({ start, end, refKwh }) {
   return result;
 }
 
+/* ---------- Benachrichtigungen ---------- */
+
+function mergeSmtp(b = {}) {
+  const s = { ...db.settings };
+  for (const k of ['smtpHost', 'smtpUser', 'smtpFrom', 'smtpTo']) if (typeof b[k] === 'string' && b[k]) s[k] = b[k].replace(/[\r\n]/g, ' ').trim();
+  if (typeof b.smtpPass === 'string' && b.smtpPass) s.smtpPass = b.smtpPass;
+  if (b.smtpPort) s.smtpPort = Number(b.smtpPort) || 465;
+  if (typeof b.smtpVerify === 'boolean') s.smtpVerify = b.smtpVerify;
+  return s;
+}
+const smtpConfig = (s) => ({
+  host: s.smtpHost, port: s.smtpPort || 465, user: s.smtpUser, pass: s.smtpPass, verify: s.smtpVerify !== false,
+  from: s.smtpFrom, fromName: 'Stromrechner', to: parseAddrs(s.smtpTo),
+});
+const deliver = (cfg, mail) => sendMail({ ...cfg, ...mail });
+
+let checking = false;
+/** Prüft Verbrauch gegen Vortage/Vormonate; sendet bei Auffälligkeit eine Mail. */
+async function runAlertCheck({ send, force = false }) {
+  if (checking) throw new Error('Prüfung läuft bereits.');
+  checking = true;
+  try {
+    const s = db.settings;
+    if (!s.haUrl || !s.haToken || !s.entityPower) throw new Error('Home Assistant ist noch nicht konfiguriert.');
+    const now = Date.now();
+    const { pts } = await fetchEntity(s, s.entityPower, neededStart(now), now);
+    const { checks, findings } = runChecks(pts, s, now);
+
+    // Doppelte Warnungen vermeiden: Tag je Datum einmal, Monat max. alle 7 Tage
+    const st = db.alertState;
+    const fresh = force ? findings : findings.filter((f) =>
+      f.kind === 'day' ? st.lastDayId !== f.id : !st.lastMonthAt || now - st.lastMonthAt > 7 * DAY);
+    let sent = false, error = null;
+    if (send && fresh.length) {
+      try {
+        await deliver(smtpConfig(s), buildAlertMail(fresh, s));
+        sent = true;
+        for (const f of fresh) {
+          if (f.kind === 'day') st.lastDayId = f.id; else st.lastMonthAt = now;
+          db.alerts.unshift({ at: new Date(now).toISOString(), kind: f.kind, label: f.label, deltaPct: Number.isFinite(f.deltaPct) ? f.deltaPct : null, current: f.current, reference: f.reference, causes: f.causes });
+        }
+        db.alerts = db.alerts.slice(0, 50);
+      } catch (e) { error = e.message; }
+    }
+    save();
+    return { checks, findings, sent, error, pending: fresh.length };
+  } finally { checking = false; }
+}
+
+/** Täglicher Zeitplan (lokale Zeit, Prüfung pro Minute). */
+async function scheduler() {
+  const s = db.settings, st = db.alertState;
+  if (!s.alertsEnabled || !s.smtpHost) return;
+  const d = new Date(), today = dayKey(d.getTime());
+  const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  if (st.lastRunDay === today || hhmm < s.alertTime || (st.retryAt && Date.now() < st.retryAt)) return;
+  try {
+    const r = await runAlertCheck({ send: true });
+    if (r.error) throw new Error(r.error);
+    st.lastRunDay = today; st.retryAt = 0; st.lastError = null; st.attempts = 0;
+  } catch (e) {
+    st.attempts = (st.attempts || 0) + 1;
+    st.lastError = `${new Date().toLocaleString('de-DE')}: ${e.message}`;
+    if (st.attempts >= 3) { st.lastRunDay = today; st.attempts = 0; st.retryAt = 0; } else st.retryAt = Date.now() + 30 * 60000;
+    console.error('Alarm-Prüfung fehlgeschlagen:', e.message);
+  }
+  save();
+}
+setInterval(() => scheduler().catch((e) => console.error(e)), 60000);
+
 /* ---------- HTTP ---------- */
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.ico': 'image/x-icon' };
@@ -218,7 +304,7 @@ function readBody(req) {
   });
 }
 const num = (v, d = 0) => { const n = Number(String(v).replace(',', '.')); return Number.isFinite(n) ? n : d; };
-const publicSettings = () => { const { haToken, ...rest } = db.settings; return { ...rest, hasToken: !!haToken }; };
+const publicSettings = () => { const { haToken, smtpPass, ...rest } = db.settings; return { ...rest, hasToken: !!haToken, hasSmtpPass: !!smtpPass }; };
 
 async function api(req, res, url) {
   const p = url.pathname;
@@ -237,6 +323,15 @@ async function api(req, res, url) {
     }
     if (typeof b.haToken === 'string' && b.haToken.trim()) s.haToken = b.haToken.trim();
     if (b.clearToken) s.haToken = '';
+    for (const k of ['smtpHost', 'smtpUser', 'smtpFrom', 'smtpTo']) if (typeof b[k] === 'string') s[k] = b[k].replace(/[\r\n]/g, ' ').trim();
+    if (typeof b.smtpPass === 'string' && b.smtpPass) s.smtpPass = b.smtpPass;
+    if (b.clearSmtpPass) s.smtpPass = '';
+    if (b.smtpPort !== undefined) { const n = Math.round(num(b.smtpPort, 465)); s.smtpPort = n > 0 && n < 65536 ? n : 465; }
+    for (const k of ['smtpVerify', 'alertsEnabled']) if (typeof b[k] === 'boolean') s[k] = b[k];
+    if (typeof b.alertTime === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(b.alertTime)) s.alertTime = b.alertTime;
+    if (b.alertDayPct !== undefined) s.alertDayPct = Math.max(1, num(b.alertDayPct, s.alertDayPct));
+    if (b.alertMonthPct !== undefined) s.alertMonthPct = Math.max(1, num(b.alertMonthPct, s.alertMonthPct));
+    if (b.alertMinKwh !== undefined) s.alertMinKwh = Math.max(0, num(b.alertMinKwh, s.alertMinKwh));
     save();
     return json(res, 200, publicSettings());
   }
@@ -287,6 +382,21 @@ async function api(req, res, url) {
     } catch (e) {
       return json(res, 200, { ok: false, error: e.cause?.code ? `${e.message} (${e.cause.code})` : e.message });
     }
+  }
+
+  if (p === '/api/mail/test' && m === 'POST') {
+    const b = await readBody(req);
+    try {
+      await deliver(smtpConfig(mergeSmtp(b)), buildTestMail());
+      return json(res, 200, { ok: true });
+    } catch (e) { return json(res, 200, { ok: false, error: e.message }); }
+  }
+
+  if (p === '/api/alerts' && m === 'GET') return json(res, 200, { log: db.alerts, state: db.alertState });
+  if (p === '/api/alerts/check' && m === 'POST') {
+    const b = await readBody(req);
+    try { return json(res, 200, await runAlertCheck({ send: !!b.send, force: true })); }
+    catch (e) { return json(res, 400, { error: e.message }); }
   }
 
   if (p === '/api/calc' && m === 'GET') {

@@ -86,3 +86,8 @@ td.empty{text-align:center;color:var(--muted);padding:26px}
 .toast.show{opacity:1;transform:translate(-50%,0)}
 footer{border-top:1px solid var(--line);color:var(--faint);font-size:12.5px;padding:18px 24px;text-align:center}
 @media print{.top,footer,.card:first-of-type,.toast{display:none}body{background:#fff;color:#000}.card,.kpi{border-color:#ccc;background:#fff}.kpi .v,h1,h2{color:#000}}
+
+label.check{display:flex;align-items:center;gap:10px;text-transform:none;font-size:13.5px;color:var(--text);font-weight:500;margin:16px 0 0;cursor:pointer}
+input[type=checkbox]{width:17px;height:17px;accent-color:var(--accent);flex:none}
+.sep{height:1px;background:var(--line);margin:20px 0}
+.msg ul{margin:6px 0 0}
