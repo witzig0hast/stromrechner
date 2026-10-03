@@ -52,7 +52,47 @@ async function haFetch(url, token, p, timeoutMs = 30000) {
   return res.json();
 }
 
-async function fetchEntity(s, entity, start, end) {
+/** WebSocket-Aufruf (Long-Term-Statistics gibt es nur per WebSocket-API). */
+function haWs(url, token, commands, timeoutMs = 45000) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(normalizeUrl(url).replace(/^http/, 'ws') + '/api/websocket');
+    const results = [];
+    const timer = setTimeout(() => { ws.close(); reject(new Error('WebSocket-Timeout')); }, timeoutMs);
+    const done = (fn, v) => { clearTimeout(timer); try { ws.close(); } catch { /* ignore */ } fn(v); };
+    ws.onerror = () => done(reject, new Error('WebSocket-Verbindung fehlgeschlagen'));
+    ws.onmessage = (ev) => {
+      const m = JSON.parse(ev.data);
+      if (m.type === 'auth_required') return ws.send(JSON.stringify({ type: 'auth', access_token: token }));
+      if (m.type === 'auth_invalid') return done(reject, new Error('Token ungültig'));
+      if (m.type === 'auth_ok') return commands.forEach((c, i) => ws.send(JSON.stringify({ id: i + 1, ...c })));
+      if (m.type === 'result') {
+        results[m.id - 1] = m.success ? m.result : null;
+        if (results.length >= commands.length && commands.every((_, i) => i in results)) done(resolve, results);
+      }
+    };
+  });
+}
+
+const toMs = (v) => (typeof v === 'number' ? (v > 1e11 ? v : v * 1000) : Date.parse(v));
+
+/** Mittelwert-Statistiken (5-Minuten für ~10 Tage, sonst Stundenwerte) als Stufen-Signal. */
+async function fetchStats(s, entity, start, end) {
+  const base = { type: 'recorder/statistics_during_period', start_time: new Date(start).toISOString(), end_time: new Date(end).toISOString(), statistic_ids: [entity], types: ['mean'] };
+  const [short, hourly] = await haWs(s.haUrl, s.haToken, [{ ...base, period: '5minute' }, { ...base, period: 'hour' }]);
+  const rows = (r) => (r?.[entity] || []).filter((x) => x.mean != null).map((x) => ({ a: toMs(x.start), b: toMs(x.end), v: x.mean }));
+  const sh = rows(short), hr = rows(hourly);
+  // Stundenwerte nur dort, wo keine 5-Minuten-Werte vorliegen
+  const firstShort = sh.length ? sh[0].a : Infinity;
+  const buckets = [...hr.filter((x) => x.b <= firstShort), ...sh];
+  const pts = [];
+  buckets.forEach((x, i) => {
+    pts.push({ t: x.a, v: x.v });
+    if (!buckets[i + 1] || buckets[i + 1].a > x.b) pts.push({ t: x.b, v: null });
+  });
+  return pts;
+}
+
+async function fetchHistory(s, entity, start, end) {
   const all = [];
   const CHUNK = 7 * DAY;
   for (let a = start; a < end; a += CHUNK) {
@@ -63,10 +103,26 @@ async function fetchEntity(s, entity, start, end) {
     const data = await haFetch(s.haUrl, s.haToken, q, 60000);
     all.push(...parseHistory(data[0]));
   }
-  // dedupe by timestamp, keep last
   const m = new Map();
   for (const p of all) m.set(p.t, p);
   return [...m.values()].sort((x, y) => x.t - y.t);
+}
+
+/** Bevorzugt Mittelwerte aus den Statistiken; Rest (laufender 5-Min-Block) und Fallback aus dem Verlauf. */
+async function fetchEntity(s, entity, start, end) {
+  let pts = [];
+  try { pts = await fetchStats(s, entity, start, end); } catch { pts = []; }
+  const hasStats = pts.length > 0;
+  if (!hasStats) return { pts: await fetchHistory(s, entity, start, end), source: 'history' };
+  const last = pts[pts.length - 1];
+  const covered = last.v === null ? last.t : end;
+  if (covered < end) {
+    const tail = await fetchHistory(s, entity, covered, end).catch(() => []);
+    const body = pts.filter((p) => !(p === last && last.v === null));
+    const t2 = tail.filter((p) => p.t >= covered);
+    if (t2.length) pts = [...body, ...t2];
+  }
+  return { pts, source: 'statistics' };
 }
 
 /* ---------- Berechnung ---------- */
@@ -85,11 +141,13 @@ async function calculate({ start, end, refKwh }) {
   endMs = Math.min(endMs, now);
   if (endMs <= startMs) throw new Error('Das Ende muss nach dem Start liegen.');
 
-  const [pw, vo, cu] = await Promise.all([
+  const none = { pts: [], source: null };
+  const [pwR, voR, cuR] = await Promise.all([
     fetchEntity(s, s.entityPower, startMs, endMs),
-    s.entityVoltage ? fetchEntity(s, s.entityVoltage, startMs, endMs) : [],
-    s.entityCurrent ? fetchEntity(s, s.entityCurrent, startMs, endMs) : [],
+    s.entityVoltage ? fetchEntity(s, s.entityVoltage, startMs, endMs) : none,
+    s.entityCurrent ? fetchEntity(s, s.entityCurrent, startMs, endMs) : none,
   ]);
+  const pw = pwR.pts, vo = voR.pts, cu = cuR.pts;
 
   const P = integrate(pw, startMs, endMs);
   const kwh = P.sum / 1000;
@@ -130,6 +188,7 @@ async function calculate({ start, end, refKwh }) {
     projectedYearCost: hours ? (cost / hours) * 8760 : 0,
     days,
     samples: pw.length,
+    source: pwR.source,
   };
   if (refKwh > 0) {
     result.refKwh = refKwh;

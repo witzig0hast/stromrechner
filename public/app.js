@@ -108,7 +108,7 @@ function render(r, cur) {
         ${k('', 'cal', 'Kosten pro Tag', nf(r.costPerDay), cur)}
         ${k('', 'trend', 'Hochrechnung / Jahr', nf(r.projectedYearCost, 0), cur)}
       </div>
-      <div class="hint">Jahreshochrechnung auf Basis des gewählten Zeitraums: ca. ${nf(r.projectedYearKwh, 0)} kWh.</div></div>
+      <div class="hint">Datenbasis: ${r.source === 'statistics' ? 'Mittelwerte der Home-Assistant-Statistik (5 Minuten, ältere Daten stündlich)' : 'Zustandsverlauf (keine Statistik für diese Entität vorhanden)'}. Jahreshochrechnung: ca. ${nf(r.projectedYearKwh, 0)} kWh.</div></div>
     </section>
     ${pct}
     <section class="card"><div class="card-h"><h2>Verbrauch pro Tag</h2><span class="tag">kWh</span></div><div class="card-b">${chart(r.days)}</div></section>

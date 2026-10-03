@@ -14,6 +14,7 @@ Zeitzone per `TZ` in `docker-compose.yml` anpassen.
 
 ## Einrichtung
 Einstellungen (Header oben rechts): Strompreis, Home-Assistant-URL, Long-Lived Token und die
-Entitäten für Leistung (W, Pflicht), Spannung (V) und Stromstärke (A). Der Verbrauch wird aus
-der Leistungs-Historie über die Zeit integriert. Ohne Ende-Datum läuft der Zeitraum bis „jetzt“ weiter.
+Entitäten für Leistung (W, Pflicht), Spannung (V) und Stromstärke (A). Der Verbrauch wird aus den
+Mittelwerten der HA-Statistik (5 Minuten, ältere Daten stündlich) über die Zeit integriert;
+ohne Statistik fällt er auf den Zustandsverlauf zurück. Ohne Ende-Datum läuft der Zeitraum bis „jetzt“ weiter.
 Frühere Gesamtverbräuche (kWh) lassen sich hinterlegen und dienen als Vergleich für den Prozentanteil.
