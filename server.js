@@ -41,7 +41,7 @@ function save() {
 
 /* ---------- Home Assistant ---------- */
 
-async function haFetch(url, token, p, timeoutMs = 87230) {
+async function haFetch(url, token, p, timeoutMs = 30000) {
   const res = await fetch(normalizeUrl(url) + p, {
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     signal: AbortSignal.timeout(timeoutMs),
