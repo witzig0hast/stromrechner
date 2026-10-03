@@ -60,7 +60,7 @@ async function dashboard() {
     try {
       const q = new URLSearchParams({ start, end, refKwh: refKwh || 0 });
       const r = await api('/calc?' + q);
-      st.innerHTML = r.coverage < 0.5 ? `<div class="msg warn">Nur ${nf(r.coverage * 100, 0)} % des Zeitraums haben Messwerte – Ergebnis ist vermutlich unvollständig.</div>` : '';
+      st.innerHTML = r.coverage < 0.98 ? `<div class="msg warn">Nur ${nf(r.coverage * 100, 0)} % des Zeitraums (${nf(r.coveredHours, 1)} von ${nf(r.hours, 1)} Std.) haben Messwerte. Durchschnitt, Kosten pro Tag und Hochrechnung beziehen sich auf die gemessene Zeit.</div>` : '';
       render(r, cur);
     } catch (e) {
       st.innerHTML = `<div class="msg err">${esc(e.message)}</div>`; $('#out').innerHTML = '';
@@ -96,12 +96,12 @@ function render(r, cur) {
     </section>` : '';
   $('#out').innerHTML = `
     <section class="card">
-      <div class="card-h"><div><h2>Ergebnis</h2><p>Preis ${nf(r.pricePerKwh, 4)} ${cur}/kWh · ${nf(r.hours / 24, 1)} Tage</p></div>
+      <div class="card-h"><div><h2>Ergebnis</h2><p>Preis ${nf(r.pricePerKwh, 4)} ${cur}/kWh · ${nf(r.coveredHours, 1)} Std. gemessen von ${nf(r.hours, 1)} Std.</p></div>
         <span class="tag ${r.open ? 'live' : ''}">${fmtDT(r.start)} – ${r.open ? 'jetzt (läuft)' : fmtDT(r.end)}</span></div>
       <div class="card-b"><div class="grid g4">
         ${k('hero', 'euro', 'Kosten', nf(r.cost), cur)}
         ${k('', 'bolt', 'Verbrauch', nf(r.kwh, 3), 'kWh')}
-        ${k('', 'gauge', 'Ø Leistung', nf(r.avgWatt, 1), 'W')}
+        ${k('', 'gauge', 'Ø Leistung (gemessen)', nf(r.avgWatt, 1), 'W')}
         ${k('', 'peak', 'Spitzenleistung', nf(r.peakWatt, 0), 'W')}
         ${r.avgVolt !== null ? k('cy', 'volt', 'Ø Spannung', nf(r.avgVolt, 1), 'V') : ''}
         ${r.avgAmpere !== null ? k('cy', 'amp', 'Ø Stromstärke', nf(r.avgAmpere, 3), 'A') : ''}

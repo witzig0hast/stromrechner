@@ -154,6 +154,7 @@ async function calculate({ start, end, refKwh }) {
   const price = Number(s.pricePerKwh) || 0;
   const cost = kwh * price;
   const hours = (endMs - startMs) / 3600000;
+  const coveredHours = P.coveredMs / 3600000; // Zeit mit tatsächlichen Messwerten
 
   const days = [];
   for (let d = dayStart(startMs); d < endMs; d = nextDay(d)) {
@@ -177,15 +178,16 @@ async function calculate({ start, end, refKwh }) {
     kwh,
     cost,
     pricePerKwh: price,
-    avgWatt: hours ? P.sum / hours : 0,
+    coveredHours,
+    avgWatt: coveredHours ? P.sum / coveredHours : 0,
     peakWatt: P.peak,
     avgVolt: avgOf(vo),
     avgAmpere: avgOf(cu),
     peakAmpere: C ? C.peak : null,
     coverage: hours ? Math.min(1, P.coveredMs / (endMs - startMs)) : 0,
-    costPerDay: days.length ? cost / (hours / 24) : 0,
-    projectedYearKwh: hours ? (kwh / hours) * 8760 : 0,
-    projectedYearCost: hours ? (cost / hours) * 8760 : 0,
+    costPerDay: coveredHours ? cost / (coveredHours / 24) : 0,
+    projectedYearKwh: coveredHours ? (kwh / coveredHours) * 8760 : 0,
+    projectedYearCost: coveredHours ? (cost / coveredHours) * 8760 : 0,
     days,
     samples: pw.length,
     source: pwR.source,
