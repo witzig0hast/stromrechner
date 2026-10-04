@@ -316,11 +316,11 @@ async function runAlertCheck({ send, force = false }) {
     let sent = false, error = null;
     if (send && fresh.length) {
       try {
-        await deliver(smtpConfig(s), buildAlertMail(fresh, s));
+        await deliver(smtpConfig(s), buildAlertMail(fresh, s, now));
         sent = true;
         for (const f of fresh) {
           if (f.kind === 'day') st.lastDayId = f.id; else st.lastMonthAt = now;
-          db.alerts.unshift({ at: new Date(now).toISOString(), kind: f.kind, label: f.label, deltaPct: Number.isFinite(f.deltaPct) ? f.deltaPct : null, current: f.current, reference: f.reference, causes: f.causes });
+          db.alerts.unshift({ at: new Date(now).toISOString(), kind: f.kind, label: f.label, deltaPct: Number.isFinite(f.deltaPct) ? f.deltaPct : null, current: f.current, reference: f.reference, causes: f.causes.map((c) => c.text) });
         }
         db.alerts = db.alerts.slice(0, 50);
       } catch (e) { error = e.message; }

@@ -293,7 +293,7 @@ async function settings() {
       const r = await api('/alerts/check', { method: 'POST', body: { send } });
       const st = { alert: ['err', 'Auffällig'], ok: ['ok', 'Unauffällig'], skipped: ['warn', 'Übersprungen'] };
       let h = r.checks.map((c) => `<div class="msg ${st[c.status][0]}"><b>${esc(c.title)}: ${st[c.status][1]}</b><br>${c.current !== undefined ? `${esc(c.label)}: ${nf(c.current)} kWh/Tag · Vergleich ${nf(c.reference)} kWh/Tag (${esc(c.refLabel)}) · ${Number.isFinite(c.deltaPct) ? (c.deltaPct >= 0 ? '+' : '') + nf(c.deltaPct, 0) + ' %' : 'neu'}<br>` : ''}${esc(c.note)}</div>`).join('');
-      r.findings.forEach((f) => { h += `<div class="msg warn"><b>Mögliche Ursachen (${f.kind === 'day' ? 'Tag' : 'Monat'}):</b><ul>${f.causes.map((c) => `<li>${esc(c)}</li>`).join('')}</ul></div>`; });
+      r.findings.forEach((f) => { h += `<div class="msg warn"><b>Mögliche Ursachen (${f.kind === 'day' ? 'Tag' : 'Monat'}):</b><ul>${f.causes.map((c) => `<li><b>${esc(c.title)}.</b> ${esc(c.text)}<br><span class="hint">Prüfen: ${esc(c.tip)}</span></li>`).join('')}</ul></div>`; });
       if (send) h += r.sent ? '<div class="msg ok">E-Mail wurde gesendet.</div>' : r.error ? `<div class="msg err">Versand fehlgeschlagen: ${esc(r.error)}</div>` : '<div class="msg ok">Keine Auffälligkeit – es wurde keine E-Mail gesendet.</div>';
       ms.innerHTML = h;
       if (r.sent) setTimeout(settings, 2500);
