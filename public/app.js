@@ -13,7 +13,7 @@ async function api(path, opts = {}) {
   if (method !== 'GET' && csrf) headers['X-CSRF-Token'] = csrf;
   const r = await fetch('/api' + path, { method, headers, body: opts.body ? JSON.stringify(opts.body) : undefined, credentials: 'same-origin' });
   const j = await r.json().catch(() => ({}));
-  if (r.status === 401 && !path.startsWith('/auth/')) { csrf = null; throw new AuthError('Sitzung abgelaufen'); }
+  if (r.status === 401 && !['/auth/login', '/auth/setup', '/auth/state'].includes(path)) { csrf = null; throw new AuthError('Sitzung abgelaufen'); }
   if (!r.ok) throw new Error(j.error || `Fehler ${r.status}`);
   return j;
 }
@@ -371,4 +371,6 @@ async function route() {
 }
 $('#logout').onclick = async () => { try { await api('/auth/logout', { method: 'POST' }); } catch { /* ignore */ } csrf = null; route(); };
 addEventListener('hashchange', route);
+// abgelaufene Sitzung bei Klicks/Hintergrundaktionen: zurück zur Anmeldung statt Fehlermeldung
+addEventListener('unhandledrejection', (ev) => { if (ev.reason instanceof AuthError) { ev.preventDefault(); route(); } });
 route();

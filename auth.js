@@ -27,6 +27,16 @@ const safeEq = (a, b) => {
 
 /* ---------- Sitzungen (nur Hash des Cookies im Speicher) ---------- */
 const sessions = new Map();
+let onChange = () => {}, lastPersist = 0;
+/** Sitzungen aus dem Speicher laden (überleben so Neustarts); onChangeFn speichert verzögert. */
+function loadSessions(saved, onChangeFn) {
+  const now = Date.now();
+  for (const [k, v] of Object.entries(saved || {})) {
+    if (v && now - v.last <= IDLE_MS && now - v.created <= ABSOLUTE_MS) sessions.set(k, v);
+  }
+  onChange = onChangeFn;
+}
+const dumpSessions = () => Object.fromEntries(sessions);
 const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
 
 function createSession() {
@@ -34,6 +44,7 @@ function createSession() {
   const now = Date.now();
   const sess = { created: now, last: now, csrf: crypto.randomBytes(24).toString('base64url') };
   sessions.set(sha(token), sess);
+  onChange();
   return { token, sess };
 }
 function getSession(token) {
@@ -42,12 +53,14 @@ function getSession(token) {
   if (!s) return null;
   if (now - s.last > IDLE_MS || now - s.created > ABSOLUTE_MS) { sessions.delete(k); return null; }
   s.last = now;
+  if (now - lastPersist > 300e3) { lastPersist = now; onChange(); }
   return s;
 }
-const destroySession = (token) => { if (token) sessions.delete(sha(token)); };
+const destroySession = (token) => { if (token) { sessions.delete(sha(token)); onChange(); } };
 function destroyAllExcept(keepToken) {
   const keep = keepToken ? sha(keepToken) : null;
-  for (const k of sessions.keys()) if (k !== keep) sessions.delete(k);
+  for (const k of [...sessions.keys()]) if (k !== keep) sessions.delete(k);
+  onChange();
 }
 setInterval(() => { const now = Date.now(); for (const [k, s] of sessions) if (now - s.last > IDLE_MS || now - s.created > ABSOLUTE_MS) sessions.delete(k); }, 600e3).unref();
 
@@ -83,4 +96,4 @@ setInterval(() => {
 
 const parseCookies = (h) => Object.fromEntries(String(h || '').split(';').map((c) => { const i = c.indexOf('='); return i < 0 ? ['', ''] : [c.slice(0, i).trim(), c.slice(i + 1).trim()]; }));
 
-module.exports = { MIN_PW, hashPassword, verifyPassword, safeEq, createSession, getSession, destroySession, destroyAllExcept, lockedFor, recordFail, clearFails, rateLimit, parseCookies };
+module.exports = { loadSessions, dumpSessions, MIN_PW, hashPassword, verifyPassword, safeEq, createSession, getSession, destroySession, destroyAllExcept, lockedFor, recordFail, clearFails, rateLimit, parseCookies };

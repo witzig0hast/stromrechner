@@ -47,11 +47,15 @@ fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 let db = structuredClone(DEFAULTS);
 try {
   const saved = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  db = { settings: { ...DEFAULTS.settings, ...saved.settings }, history: saved.history || [], alerts: saved.alerts || [], alertState: saved.alertState || {}, auth: saved.auth || null };
+  db = { settings: { ...DEFAULTS.settings, ...saved.settings }, history: saved.history || [], alerts: saved.alerts || [], alertState: saved.alertState || {}, auth: saved.auth || null, sessions: saved.sessions || {} };
 } catch { /* first start */ }
 
+auth.loadSessions(db.sessions, () => saveSoon());
+let saveTimer = null;
+const saveSoon = () => { clearTimeout(saveTimer); saveTimer = setTimeout(save, 1000); };
 function save() {
   const tmp = DB_FILE + '.tmp';
+  db.sessions = auth.dumpSessions();
   fs.writeFileSync(tmp, JSON.stringify(db, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, DB_FILE);
 }
