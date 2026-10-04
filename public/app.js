@@ -4,16 +4,23 @@ const app = $('#app');
 const nf = (n, d = 2) => Number(n).toLocaleString('de-DE', { minimumFractionDigits: d, maximumFractionDigits: d });
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+let csrf = null;
+class AuthError extends Error {}
 async function api(path, opts = {}) {
-  const r = await fetch('/api' + path, {
-    method: opts.method || 'GET',
-    headers: opts.body ? { 'Content-Type': 'application/json' } : undefined,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
+  const method = opts.method || 'GET';
+  const headers = {};
+  if (opts.body) headers['Content-Type'] = 'application/json';
+  if (method !== 'GET' && csrf) headers['X-CSRF-Token'] = csrf;
+  const r = await fetch('/api' + path, { method, headers, body: opts.body ? JSON.stringify(opts.body) : undefined, credentials: 'same-origin' });
   const j = await r.json().catch(() => ({}));
+  if (r.status === 401 && !path.startsWith('/auth/')) { csrf = null; throw new AuthError('Sitzung abgelaufen'); }
   if (!r.ok) throw new Error(j.error || `Fehler ${r.status}`);
   return j;
 }
+const store = {
+  get: (k, d) => { try { return localStorage.getItem('sr_' + k) ?? d; } catch { return d; } },
+  set: (k, v) => { try { localStorage.setItem('sr_' + k, v); } catch { /* ignore */ } },
+};
 function toast(t) {
   const el = $('#toast'); el.textContent = t; el.classList.add('show');
   clearTimeout(toast.t); toast.t = setTimeout(() => el.classList.remove('show'), 2200);
@@ -22,52 +29,95 @@ const fmtDate = (s) => s ? new Date(s).toLocaleDateString('de-DE') : '–';
 const fmtDT = (iso) => new Date(iso).toLocaleString('de-DE', { dateStyle: 'medium', timeStyle: 'short' });
 
 /* ---------------- Dashboard ---------------- */
+let refreshTimer = null;
+const p2 = (n) => String(n).padStart(2, '0');
+const dtLocal = (d) => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}T${p2(d.getHours())}:${p2(d.getMinutes())}`;
+const PRESETS = [['today', 'Heute'], ['7d', '7 Tage'], ['30d', '30 Tage'], ['month', 'Dieser Monat'], ['year', 'Dieses Jahr'], ['custom', 'Eigener Zeitraum']];
+function presetRange(id, custom) {
+  const n = new Date(), d0 = new Date(n.getFullYear(), n.getMonth(), n.getDate());
+  const off = (days) => dtLocal(new Date(d0.getFullYear(), d0.getMonth(), d0.getDate() - days));
+  if (id === 'today') return { start: dtLocal(d0), end: '' };
+  if (id === '7d') return { start: off(6), end: '' };
+  if (id === '30d') return { start: off(29), end: '' };
+  if (id === 'month') return { start: dtLocal(new Date(n.getFullYear(), n.getMonth(), 1)), end: '' };
+  if (id === 'year') return { start: dtLocal(new Date(n.getFullYear(), 0, 1)), end: '' };
+  return custom;
+}
+
 async function dashboard() {
   const [s, hist] = await Promise.all([api('/settings'), api('/history')]);
   const cur = s.currency;
+  const configured = s.hasToken && s.haUrl && s.entityPower;
+  let preset = store.get('preset', s.measureStart ? 'custom' : '7d');
+  if (!PRESETS.some(([id]) => id === preset)) preset = '7d';
+  const savedRef = store.get('ref', '');
   app.innerHTML = `
     <div class="head"><h1>Auswertung</h1>
-    <p class="sub">Verbrauch und Kosten deiner Steckdose aus Home Assistant für einen frei wählbaren Zeitraum.</p></div>
-    <section class="card">
-      <div class="card-h"><div><h2>Zeitraum &amp; Vergleich</h2><p>Messzeitraum festlegen und optional mit dem Gesamtverbrauch vergleichen.</p></div></div>
-      <div class="card-b"><div class="row">
+    <p class="sub">Verbrauch und Kosten deiner Steckdose aus Home Assistant.</p></div>
+    <section class="card"><div class="card-b bar-row">
+      <div class="chips" role="tablist" aria-label="Zeitraum">${PRESETS.map(([id, l]) => `<button class="chip${id === preset ? ' on' : ''}" data-p="${id}" role="tab">${l}</button>`).join('')}</div>
+      <div class="cmp"><label for="ref">Vergleich mit Gesamtverbrauch</label>
+        <select id="ref"><option value="">– kein Vergleich –</option>
+          ${hist.map((h) => `<option value="${h.kwh}">${esc(h.label)} · ${nf(h.kwh, 0)} kWh</option>`).join('')}
+          <option value="custom">Eigener Wert …</option></select></div>
+      <button class="btn ghost sm" id="go" title="Neu laden">Aktualisieren</button>
+    </div>
+    <div class="card-b custom" id="customBox" ${preset === 'custom' ? '' : 'hidden'}>
+      <div class="row">
         <div><label for="start">Start</label><input type="datetime-local" id="start" value="${esc(s.measureStart)}"></div>
         <div><label for="end">Ende (leer = läuft weiter)</label><input type="datetime-local" id="end" value="${esc(s.measureEnd)}"></div>
-        <div><label for="ref">Gesamtverbrauch (Vergleich)</label>
-          <select id="ref"><option value="">– kein Vergleich –</option>
-            ${hist.map((h) => `<option value="${h.kwh}">${esc(h.label)} · ${nf(h.kwh, 0)} kWh</option>`).join('')}
-            <option value="custom">Eigener Wert …</option></select></div>
         <div id="customWrap" hidden><label for="custom">Gesamt kWh</label><input id="custom" inputmode="decimal" placeholder="z. B. 2850"></div>
-        <button class="btn" id="go">Berechnen</button>
+        <button class="btn ghost sm" id="saveRange">Als Standard speichern</button>
       </div>
-      <div class="actions"><button class="btn ghost sm" id="saveRange">Zeitraum als Standard speichern</button></div>
-      <div id="status"></div></div>
-    </section>
+    </div>
+    <div class="card-b" id="status" hidden></div></section>
     <div id="out"></div>`;
 
   const ref = $('#ref');
-  ref.onchange = () => { $('#customWrap').hidden = ref.value !== 'custom'; };
+  if ([...ref.options].some((o) => o.value === savedRef)) ref.value = savedRef;
+  $('#customWrap').hidden = ref.value !== 'custom';
+
+  const status = (html) => { const el = $('#status'); el.hidden = !html; el.innerHTML = html || ''; };
+  let seq = 0;
+  const run = async (quiet) => {
+    const my = ++seq;
+    const range = presetRange(preset, { start: $('#start').value, end: $('#end').value });
+    if (!configured) {
+      $('#out').innerHTML = `<section class="card"><div class="card-b empty-state"><h2>Home Assistant verbinden</h2><p class="sub">Trage in den Einstellungen die URL, den Zugriffstoken und die Leistungs-Entität deiner Steckdose ein, dann erscheint hier sofort deine Auswertung.</p><a class="btn" href="#/settings">Zu den Einstellungen</a></div></section>`;
+      return;
+    }
+    if (!range.start) { status('<div class="msg warn">Bitte einen Start wählen.</div>'); return; }
+    const refKwh = ref.value === 'custom' ? $('#custom').value.replace(',', '.') : ref.value;
+    if (!quiet) { $('#out').classList.add('loading'); status('<div class="msg ok"><span class="spin"></span>Lade Daten aus Home Assistant …</div>'); }
+    try {
+      const r = await api('/calc?' + new URLSearchParams({ start: range.start, end: range.end, refKwh: refKwh || 0 }));
+      if (my !== seq) return;
+      status(r.coverage < 0.98 ? `<div class="msg warn">Nur ${nf(r.coverage * 100, 0)} % des Zeitraums (${nf(r.coveredHours, 1)} von ${nf(r.hours, 1)} Std.) haben Messwerte. Durchschnitt, Kosten pro Tag und Hochrechnung beziehen sich auf die gemessene Zeit.</div>` : '');
+      render(r, cur);
+    } catch (e) {
+      if (e instanceof AuthError) throw e;
+      if (my !== seq) return;
+      status(`<div class="msg err">${esc(e.message)}</div>`); $('#out').innerHTML = '';
+    } finally { $('#out').classList.remove('loading'); }
+  };
+
+  app.querySelectorAll('.chip').forEach((b) => b.onclick = () => {
+    preset = b.dataset.p; store.set('preset', preset);
+    app.querySelectorAll('.chip').forEach((x) => x.classList.toggle('on', x === b));
+    $('#customBox').hidden = preset !== 'custom';
+    run();
+  });
+  ref.onchange = () => { store.set('ref', ref.value); $('#customWrap').hidden = ref.value !== 'custom'; $('#customBox').hidden = preset !== 'custom' && ref.value !== 'custom'; run(); };
+  let deb; const later = () => { clearTimeout(deb); deb = setTimeout(run, 500); };
+  ['start', 'end', 'custom'].forEach((id) => { $('#' + id).onchange = later; });
+  $('#go').onclick = () => run();
   $('#saveRange').onclick = async () => {
     await api('/settings', { method: 'PUT', body: { measureStart: $('#start').value, measureEnd: $('#end').value } });
     toast('Zeitraum gespeichert');
   };
-  const run = async () => {
-    const start = $('#start').value, end = $('#end').value;
-    let refKwh = ref.value === 'custom' ? $('#custom').value.replace(',', '.') : ref.value;
-    const btn = $('#go'), st = $('#status');
-    if (!start) { st.innerHTML = '<div class="msg warn">Bitte ein Startdatum wählen.</div>'; return; }
-    btn.disabled = true; st.innerHTML = '<div class="msg ok"><span class="spin"></span>Lade Daten aus Home Assistant …</div>';
-    try {
-      const q = new URLSearchParams({ start, end, refKwh: refKwh || 0 });
-      const r = await api('/calc?' + q);
-      st.innerHTML = r.coverage < 0.98 ? `<div class="msg warn">Nur ${nf(r.coverage * 100, 0)} % des Zeitraums (${nf(r.coveredHours, 1)} von ${nf(r.hours, 1)} Std.) haben Messwerte. Durchschnitt, Kosten pro Tag und Hochrechnung beziehen sich auf die gemessene Zeit.</div>` : '';
-      render(r, cur);
-    } catch (e) {
-      st.innerHTML = `<div class="msg err">${esc(e.message)}</div>`; $('#out').innerHTML = '';
-    } finally { btn.disabled = false; }
-  };
-  $('#go').onclick = run;
-  if (s.measureStart && s.hasToken) run();
+  clearInterval(refreshTimer);
+  refreshTimer = setInterval(() => { if (!document.hidden && !presetRange(preset, { start: $('#start').value, end: $('#end').value }).end) run(true).catch(() => route()); }, 60000);
+  await run();
 }
 
 const ICON = {
@@ -91,7 +141,7 @@ function render(r, cur) {
         ${k('', 'bolt', 'Steckdose', nf(r.kwh), 'kWh')}
         ${k('', 'bolt', 'Gesamtverbrauch', nf(r.refKwh), 'kWh')}
       </div>
-      <div class="bar"><i style="width:${Math.min(100, r.percent)}%"></i></div>
+      <div class="bar"><i data-w="${Math.min(100, r.percent)}"></i></div>
       <div class="hint">Die Steckdose entspricht ${nf(r.cost)} ${cur} von insgesamt ca. ${nf(r.refCost)} ${cur}.</div></div>
     </section>` : '';
   $('#out').innerHTML = `
@@ -113,9 +163,10 @@ function render(r, cur) {
     ${pct}
     <section class="card"><div class="card-h"><h2>Verbrauch pro Tag</h2><span class="tag">kWh</span></div><div class="card-b">${chart(r.days)}</div></section>
     <section class="card"><div class="card-h"><h2>Tagesübersicht</h2></div><div class="card-b">
-      <div class="tbl" style="max-height:360px"><table><thead><tr><th>Datum</th><th class="r">kWh</th><th class="r">Kosten</th></tr></thead><tbody>
+      <div class="tbl tall"><table><thead><tr><th>Datum</th><th class="r">kWh</th><th class="r">Kosten</th></tr></thead><tbody>
       ${[...r.days].reverse().map((d) => `<tr><td>${fmtDate(d.date)}</td><td class="r">${nf(d.kwh, 3)}</td><td class="r">${nf(d.cost)} ${cur}</td></tr>`).join('')}
       </tbody></table></div></div></section>`;
+  $('#out').querySelectorAll('[data-w]').forEach((e) => { e.style.width = e.dataset.w + '%'; });
 }
 
 function chart(days) {
@@ -139,7 +190,7 @@ function chart(days) {
 
 /* ---------------- Einstellungen ---------------- */
 async function settings() {
-  const [s, hist, al] = await Promise.all([api('/settings'), api('/history'), api('/alerts')]);
+  const [s, hist, al, as] = await Promise.all([api('/settings'), api('/history'), api('/alerts'), api('/auth/state')]);
   app.innerHTML = `
     <div class="head"><h1>Einstellungen</h1>
     <p class="sub">Strompreis, Home-Assistant-Anbindung und frühere Verbrauchswerte verwalten.</p></div>
@@ -187,7 +238,18 @@ async function settings() {
       <div class="actions"><button class="btn" id="saveMail">Speichern</button><button class="btn ghost" id="testMail">Testmail senden</button><button class="btn ghost" id="checkNow">Jetzt prüfen (Vorschau)</button><button class="btn ghost" id="checkSend">Prüfen &amp; E-Mail senden</button></div>
       ${al.state.lastError ? `<div class="msg err">Letzter automatischer Versand fehlgeschlagen: ${esc(al.state.lastError)}</div>` : ''}
       <div id="mailStatus"></div>
-      ${al.log.length ? `<div class="tbl" style="margin-top:18px;max-height:280px"><table><thead><tr><th>Gesendet</th><th>Art</th><th>Zeitraum</th><th class="r">Abweichung</th></tr></thead><tbody>${al.log.map((a) => `<tr><td>${fmtDT(a.at)}</td><td>${a.kind === 'day' ? 'Tag' : 'Monat'}</td><td>${esc(a.label)}</td><td class="r">${a.deltaPct === null ? '–' : '+' + nf(a.deltaPct, 0) + ' %'}</td></tr>`).join('')}</tbody></table></div>` : ''}
+      ${al.log.length ? `<div class="tbl mid"><table><thead><tr><th>Gesendet</th><th>Art</th><th>Zeitraum</th><th class="r">Abweichung</th></tr></thead><tbody>${al.log.map((a) => `<tr><td>${fmtDT(a.at)}</td><td>${a.kind === 'day' ? 'Tag' : 'Monat'}</td><td>${esc(a.label)}</td><td class="r">${a.deltaPct === null ? '–' : '+' + nf(a.deltaPct, 0) + ' %'}</td></tr>`).join('')}</tbody></table></div>` : ''}
+    </div></section>
+
+    <section class="card"><div class="card-h"><div><h2>Sicherheit</h2><p>Zugang zur Oberfläche.</p></div></div><div class="card-b">
+      ${as.managedByEnv ? '<div class="hint">Das Passwort wird über die Umgebungsvariable ADMIN_PASSWORD verwaltet.</div>' : `
+      <div class="grid g3">
+        <div><label for="pc">Aktuelles Passwort</label><input id="pc" type="password" autocomplete="current-password"></div>
+        <div><label for="pn">Neues Passwort (min. 10 Zeichen)</label><input id="pn" type="password" autocomplete="new-password"></div>
+        <div><label for="pn2">Neues Passwort wiederholen</label><input id="pn2" type="password" autocomplete="new-password"></div>
+      </div>
+      <div class="actions"><button class="btn" id="chPw">Passwort ändern</button></div>
+      <div id="pwStatus"></div>`}
     </div></section>
 
     <section class="card"><div class="card-h"><div><h2>Frühere Ergebnisse</h2><p>Gesamtverbrauch vergangener Zeiträume, nutzbar als Vergleichswert.</p></div></div><div class="card-b">
@@ -199,7 +261,7 @@ async function settings() {
         <button class="btn" id="addH">Hinzufügen</button>
       </div>
       <div id="hErr"></div>
-      <div class="tbl" style="margin-top:18px"><table><thead><tr><th>Bezeichnung</th><th>Zeitraum</th><th class="r">kWh</th><th class="r">Kosten (aktueller Preis)</th><th></th></tr></thead><tbody>
+      <div class="tbl top"><table><thead><tr><th>Bezeichnung</th><th>Zeitraum</th><th class="r">kWh</th><th class="r">Kosten (aktueller Preis)</th><th></th></tr></thead><tbody>
       ${hist.length ? hist.map((h) => `<tr><td>${esc(h.label)}</td><td>${h.from || h.to ? `${fmtDate(h.from)} – ${fmtDate(h.to)}` : '–'}</td><td class="r">${nf(h.kwh, 0)}</td><td class="r">${nf(h.kwh * s.pricePerKwh)} ${esc(s.currency)}</td><td class="r"><button class="btn danger sm" data-del="${h.id}">Löschen</button></td></tr>`).join('') : '<tr><td colspan="5" class="empty">Noch keine Einträge.</td></tr>'}
       </tbody></table></div></div>
     </section>`;
@@ -235,7 +297,7 @@ async function settings() {
       const r = await api('/alerts/check', { method: 'POST', body: { send } });
       const st = { alert: ['err', 'Auffällig'], ok: ['ok', 'Unauffällig'], skipped: ['warn', 'Übersprungen'] };
       let h = r.checks.map((c) => `<div class="msg ${st[c.status][0]}"><b>${esc(c.title)}: ${st[c.status][1]}</b><br>${c.current !== undefined ? `${esc(c.label)}: ${nf(c.current)} kWh/Tag · Vergleich ${nf(c.reference)} kWh/Tag (${esc(c.refLabel)}) · ${Number.isFinite(c.deltaPct) ? (c.deltaPct >= 0 ? '+' : '') + nf(c.deltaPct, 0) + ' %' : 'neu'}<br>` : ''}${esc(c.note)}</div>`).join('');
-      r.findings.forEach((f) => { h += `<div class="msg warn"><b>Mögliche Ursachen (${f.kind === 'day' ? 'Tag' : 'Monat'}):</b><ul style="margin:6px 0 0;padding-left:20px">${f.causes.map((c) => `<li>${esc(c)}</li>`).join('')}</ul></div>`; });
+      r.findings.forEach((f) => { h += `<div class="msg warn"><b>Mögliche Ursachen (${f.kind === 'day' ? 'Tag' : 'Monat'}):</b><ul>${f.causes.map((c) => `<li>${esc(c)}</li>`).join('')}</ul></div>`; });
       if (send) h += r.sent ? '<div class="msg ok">E-Mail wurde gesendet.</div>' : r.error ? `<div class="msg err">Versand fehlgeschlagen: ${esc(r.error)}</div>` : '<div class="msg ok">Keine Auffälligkeit – es wurde keine E-Mail gesendet.</div>';
       ms.innerHTML = h;
       if (r.sent) setTimeout(settings, 2500);
@@ -243,6 +305,16 @@ async function settings() {
   };
   $('#checkNow').onclick = runCheck(false);
   $('#checkSend').onclick = runCheck(true);
+  const chPw = $('#chPw');
+  if (chPw) chPw.onclick = async () => {
+    const st = $('#pwStatus');
+    if ($('#pn').value !== $('#pn2').value) { st.innerHTML = '<div class="msg err">Die neuen Passwörter stimmen nicht überein.</div>'; return; }
+    try {
+      await api('/auth/password', { method: 'POST', body: { current: $('#pc').value, password: $('#pn').value } });
+      ['#pc', '#pn', '#pn2'].forEach((i) => { $(i).value = ''; });
+      st.innerHTML = '<div class="msg ok">Passwort geändert. Andere Sitzungen wurden abgemeldet.</div>';
+    } catch (e) { st.innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
+  };
   $('#addH').onclick = async () => {
     try {
       await api('/history', { method: 'POST', body: { label: $('#hl').value, from: $('#hf').value, to: $('#ht').value, kwh: $('#hk').value } });
@@ -255,12 +327,48 @@ async function settings() {
   });
 }
 
+/* ---------------- Anmeldung ---------------- */
+function authScreen(st) {
+  clearInterval(refreshTimer);
+  const setup = st.setupRequired;
+  app.innerHTML = `
+    <div class="auth-wrap"><section class="card auth">
+      <div class="card-h"><div><h2>${setup ? 'Einrichtung' : 'Anmelden'}</h2><p>${setup ? 'Lege das Passwort für diese Oberfläche fest. Den Einrichtungscode findest du im Container-Log.' : 'Bitte melde dich an, um die Auswertung zu sehen.'}</p></div></div>
+      <form class="card-b" id="af" autocomplete="on">
+        ${setup ? '<div class="field"><label for="ac">Einrichtungscode</label><input id="ac" autocomplete="off" required></div>' : ''}
+        <div class="field"><label for="ap">Passwort${setup ? ' (min. 10 Zeichen)' : ''}</label><input id="ap" type="password" autocomplete="${setup ? 'new-password' : 'current-password'}" required></div>
+        ${setup ? '<div class="field"><label for="ap2">Passwort wiederholen</label><input id="ap2" type="password" autocomplete="new-password" required></div>' : ''}
+        <button class="btn block" type="submit">${setup ? 'Passwort festlegen' : 'Anmelden'}</button>
+        <div id="aerr"></div>
+      </form></section></div>`;
+  $('#af').onsubmit = async (ev) => {
+    ev.preventDefault();
+    const err = $('#aerr');
+    if (setup && $('#ap').value !== $('#ap2').value) { err.innerHTML = '<div class="msg err">Die Passwörter stimmen nicht überein.</div>'; return; }
+    try {
+      const r = await api(setup ? '/auth/setup' : '/auth/login', { method: 'POST', body: setup ? { code: $('#ac').value, password: $('#ap').value } : { password: $('#ap').value } });
+      csrf = r.csrf; route();
+    } catch (e) { err.innerHTML = `<div class="msg err">${esc(e.message)}</div>`; $('#ap').value = ''; }
+  };
+  ($('#ac') || $('#ap')).focus();
+}
+
 /* ---------------- Router ---------------- */
 async function route() {
-  const page = location.hash.startsWith('#/settings') ? 'settings' : 'dash';
-  document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('on', a.dataset.nav === page));
-  try { await (page === 'settings' ? settings() : dashboard()); }
-  catch (e) { app.innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
+  clearInterval(refreshTimer);
+  try {
+    const st = await api('/auth/state');
+    document.body.classList.toggle('anon', !st.authenticated);
+    if (!st.authenticated) { csrf = null; return authScreen(st); }
+    csrf = st.csrf;
+    const page = location.hash.startsWith('#/settings') ? 'settings' : 'dash';
+    document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('on', a.dataset.nav === page));
+    await (page === 'settings' ? settings() : dashboard());
+  } catch (e) {
+    if (e instanceof AuthError) return route();
+    app.innerHTML = `<div class="msg err">${esc(e.message)}</div>`;
+  }
 }
+$('#logout').onclick = async () => { try { await api('/auth/logout', { method: 'POST' }); } catch { /* ignore */ } csrf = null; route(); };
 addEventListener('hashchange', route);
 route();

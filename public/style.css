@@ -91,3 +91,28 @@ label.check{display:flex;align-items:center;gap:10px;text-transform:none;font-si
 input[type=checkbox]{width:17px;height:17px;accent-color:var(--accent);flex:none}
 .sep{height:1px;background:var(--line);margin:20px 0}
 .msg ul{margin:6px 0 0}
+
+body.anon nav{display:none}
+.navbtn{background:transparent;border:1px solid transparent;color:var(--faint);font:inherit;font-weight:500;font-size:14px;padding:8px 12px;border-radius:8px;cursor:pointer}
+.navbtn:hover{color:var(--red);background:var(--surface)}
+.auth-wrap{display:grid;place-items:center;padding-top:6vh}
+.auth{width:100%;max-width:420px}
+.field{margin-bottom:16px}
+.btn.block{width:100%}
+.bar-row{display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap}
+.chips{display:flex;gap:6px;flex-wrap:wrap;flex:1 1 auto}
+.chip{background:var(--bg);color:var(--muted);border:1px solid var(--line2);border-radius:99px;padding:7px 12px;font:inherit;font-size:13.5px;font-weight:500;cursor:pointer;transition:.15s}
+.chip:hover{color:var(--text);border-color:#40506a}
+.chip.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:650}
+.cmp{min-width:220px;flex:0 1 240px}
+.bar-row .btn{margin-left:auto}
+.custom{border-top:1px solid var(--line)}
+.card-b[hidden],.card-b#status:empty{display:none}
+#status{border-top:1px solid var(--line);padding-top:0}
+#status .msg{margin:0}
+.empty-state{text-align:center;padding:44px 22px}
+.empty-state .sub{margin:8px auto 20px}
+.empty-state .btn{display:inline-block;text-decoration:none}
+#out.loading{opacity:.5;transition:opacity .2s}
+.tbl.tall{max-height:360px}.tbl.mid{max-height:280px;margin-top:18px}.tbl.top{margin-top:18px}
+.msg ul{padding-left:20px}

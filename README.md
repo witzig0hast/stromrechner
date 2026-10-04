@@ -9,7 +9,8 @@ für einen frei wählbaren Zeitraum berechnet und mit dem Gesamtverbrauch vergle
 docker compose up -d --build
 ```
 
-Dann `http://localhost:8723` öffnen. Daten liegen im Volume `/data` (`db.json`).
+Dann `http://localhost:8723` öffnen. Beim ersten Start steht ein **Einrichtungscode** im Log
+(`docker compose logs stromrechner`); damit legst du im Browser das Passwort fest (oder du setzt `ADMIN_PASSWORD`). Daten liegen im Volume `/data` (`db.json`).
 Zeitzone per `TZ` in `docker-compose.yml` anpassen.
 
 ## Einrichtung
@@ -27,3 +28,21 @@ Täglich zur eingestellten Uhrzeit wird geprüft:
 
 Bei Überschreitung der Schwellen (Prozent und Mindest-Mehrverbrauch) geht eine E-Mail raus. Die Ursachenanalyse
 (Grundlast, Laufzeit, Spitzenleistung, Zeitfenster) ist regelbasiert, ohne KI.
+
+## Dashboard
+Die Auswertung lädt sofort beim Öffnen. Zeitraum per Schnellwahl (Heute, 7 Tage, 30 Tage, Dieser Monat,
+Dieses Jahr) oder „Eigener Zeitraum“; läuft der Zeitraum bis „jetzt“, aktualisiert sich die Seite jede Minute.
+
+## Sicherheit
+- Pflicht-Login (scrypt-Passwort-Hash, Sitzungs-Cookie `HttpOnly` + `SameSite=Strict`, `Secure` unter HTTPS),
+  Sperre nach 5 Fehlversuchen (15 Min.), Erst-Einrichtung nur mit Code aus dem Log
+- CSRF-Token + Origin-Prüfung bei allen schreibenden Anfragen
+- Strenge CSP (kein Inline-Script/-Style), `X-Frame-Options`, `nosniff`, `Referrer-Policy: no-referrer`
+- Geheimnisse (HA-Token, SMTP-Passwort) werden nie an den Browser gesendet; bei geänderter URL/Server müssen sie
+  neu eingegeben werden, damit sie nicht an fremde Hosts gehen
+- Eingabevalidierung (URL, Entitäten, Datum, E-Mail), Größen- und Zeitraumlimits, Rate-Limit
+- Container: Non-Root, read-only Dateisystem, alle Capabilities entfernt, `no-new-privileges`, Ressourcenlimits
+- Daten liegen in `/data/db.json` (Rechte 0600) – das Volume wie ein Geheimnis behandeln (Backups!).
+
+Für Zugriff über das Internet: HTTPS-Reverse-Proxy (z. B. Caddy/Traefik/nginx) davorsetzen und `TRUST_PROXY=1` setzen.
+Ohne HTTPS wird das Passwort im Klartext übertragen – nur im vertrauenswürdigen Heimnetz betreiben.

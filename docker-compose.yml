@@ -4,10 +4,24 @@ services:
     container_name: stromrechner
     restart: unless-stopped
     ports:
-      - "8723:8723"
+      - "8723:8723"            # hinter einem HTTPS-Reverse-Proxy z. B. "127.0.0.1:8723:8723"
     environment:
       TZ: Europe/Berlin
+      # Optional: Passwort fest vorgeben (min. 10 Zeichen). Ohne Angabe erscheint beim ersten Start
+      # ein Einrichtungscode im Container-Log (docker compose logs stromrechner).
+      # ADMIN_PASSWORD: "bitte-ein-langes-passwort"
+      # Nur setzen, wenn ein vertrauenswürdiger Reverse-Proxy X-Forwarded-* setzt:
+      # TRUST_PROXY: "1"
     volumes:
       - stromrechner-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
 volumes:
   stromrechner-data:

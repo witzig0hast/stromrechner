@@ -3,7 +3,8 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { sendMail, parseAddrs } = require('./smtp');
+const auth = require('./auth');
+const { sendMail, parseAddrs, EMAIL_RE } = require('./smtp');
 const { runChecks, buildAlertMail, buildTestMail, neededStart } = require('./alerts');
 const { DAY, nextDay, dayStart, dayKey, integrate, parseHistory, normalizeUrl } = require('./lib');
 
@@ -42,16 +43,16 @@ const DEFAULTS = {
   alertState: {},
 };
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 let db = structuredClone(DEFAULTS);
 try {
   const saved = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  db = { settings: { ...DEFAULTS.settings, ...saved.settings }, history: saved.history || [], alerts: saved.alerts || [], alertState: saved.alertState || {} };
+  db = { settings: { ...DEFAULTS.settings, ...saved.settings }, history: saved.history || [], alerts: saved.alerts || [], alertState: saved.alertState || {}, auth: saved.auth || null };
 } catch { /* first start */ }
 
 function save() {
   const tmp = DB_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(db, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, DB_FILE);
 }
 
@@ -220,9 +221,15 @@ async function calculate({ start, end, refKwh }) {
 
 function mergeSmtp(b = {}) {
   const s = { ...db.settings };
-  for (const k of ['smtpHost', 'smtpUser', 'smtpFrom', 'smtpTo']) if (typeof b[k] === 'string' && b[k]) s[k] = b[k].replace(/[\r\n]/g, ' ').trim();
-  if (typeof b.smtpPass === 'string' && b.smtpPass) s.smtpPass = b.smtpPass;
-  if (b.smtpPort) s.smtpPort = Number(b.smtpPort) || 465;
+  const host = typeof b.smtpHost === 'string' && b.smtpHost ? str(b.smtpHost, 253).toLowerCase() : s.smtpHost;
+  if (host && !HOST_RE.test(host)) return { error: 'SMTP-Server ist ungültig.' };
+  const newPass = typeof b.smtpPass === 'string' && b.smtpPass ? b.smtpPass.slice(0, 500) : '';
+  // gespeichertes Passwort nur an den gespeicherten Server senden
+  if (!newPass && host !== s.smtpHost) return { error: 'Bei geändertem Server bitte das Passwort neu eingeben.' };
+  s.smtpHost = host;
+  if (newPass) s.smtpPass = newPass;
+  for (const k of ['smtpUser', 'smtpFrom', 'smtpTo']) if (typeof b[k] === 'string' && b[k]) s[k] = str(b[k], 500);
+  if (b.smtpPort) { const n = Math.round(Number(b.smtpPort)); s.smtpPort = n > 0 && n < 65536 ? n : 465; }
   if (typeof b.smtpVerify === 'boolean') s.smtpVerify = b.smtpVerify;
   return s;
 }
@@ -288,142 +295,331 @@ setInterval(() => scheduler().catch((e) => console.error(e)), 60000);
 
 /* ---------- HTTP ---------- */
 
-const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.ico': 'image/x-icon' };
+const TRUST_PROXY = process.env.TRUST_PROXY === '1';
+const COOKIE = 'sr_session';
+const STATIC = {
+  '/': ['index.html', 'text/html; charset=utf-8'],
+  '/index.html': ['index.html', 'text/html; charset=utf-8'],
+  '/style.css': ['style.css', 'text/css; charset=utf-8'],
+  '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
+};
+const STATIC_CACHE = Object.fromEntries(Object.entries(STATIC).map(([k, [f]]) => [k, fs.readFileSync(path.join(PUBLIC, f))]));
 
-function json(res, code, body) {
-  const s = JSON.stringify(body);
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-  res.end(s);
+const SEC_HEADERS = {
+  'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Resource-Policy': 'same-origin',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
+};
+const isHttps = (req) => !!req.socket.encrypted || (TRUST_PROXY && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https');
+const clientIp = (req) => (TRUST_PROXY && req.headers['x-forwarded-for'] ? String(req.headers['x-forwarded-for']).split(',').pop().trim() : req.socket.remoteAddress) || 'unknown';
+
+function send(req, res, code, body, headers = {}) {
+  const h = { ...SEC_HEADERS, ...headers };
+  if (isHttps(req)) h['Strict-Transport-Security'] = 'max-age=31536000';
+  res.writeHead(code, h);
+  res.end(body);
 }
+function json(req, res, code, body, headers = {}) {
+  send(req, res, code, JSON.stringify(body), { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
+}
+class HttpError extends Error { constructor(code, msg) { super(msg); this.code = code; } }
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
+    if (!/^application\/json\b/i.test(req.headers['content-type'] || '')) return reject(new HttpError(415, 'Content-Type muss application/json sein'));
     let data = '';
-    req.on('data', (c) => { data += c; if (data.length > 1e6) { reject(new Error('Body zu groß')); req.destroy(); } });
-    req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch { reject(new Error('Ungültiges JSON')); } });
+    req.setEncoding('utf8');
+    req.on('data', (c) => { data += c; if (data.length > 65536) { reject(new HttpError(413, 'Anfrage zu groß')); req.destroy(); } });
+    req.on('end', () => { try { const j = data ? JSON.parse(data) : {}; resolve(j && typeof j === 'object' && !Array.isArray(j) ? j : {}); } catch { reject(new HttpError(400, 'Ungültiges JSON')); } });
     req.on('error', reject);
   });
 }
 const num = (v, d = 0) => { const n = Number(String(v).replace(',', '.')); return Number.isFinite(n) ? n : d; };
+const str = (v, max = 200) => (typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, max) : '');
 const publicSettings = () => { const { haToken, smtpPass, ...rest } = db.settings; return { ...rest, hasToken: !!haToken, hasSmtpPass: !!smtpPass }; };
 
-async function api(req, res, url) {
-  const p = url.pathname;
-  const m = req.method;
+const ENTITY_RE = /^[a-z0-9_]+\.[a-z0-9_]+$/;
+const HOST_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]*[a-z0-9])?$|^\[[0-9a-f:]+\]$/i;
+const LOCAL_DT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
+const MAX_RANGE_DAYS = 800;
 
-  if (p === '/api/health') return json(res, 200, { ok: true });
+/** HA-URL prüfen: nur http(s), keine Zugangsdaten/Query. Gibt normalisierte URL oder wirft. */
+function cleanHaUrl(v) {
+  const t = String(v || '').trim();
+  if (!t) return '';
+  let u;
+  try { u = new URL(t); } catch { throw new HttpError(400, 'Home-Assistant-URL ist ungültig.'); }
+  if (!['http:', 'https:'].includes(u.protocol)) throw new HttpError(400, 'Nur http:// oder https:// erlaubt.');
+  if (u.username || u.password || u.search || u.hash) throw new HttpError(400, 'URL darf keine Zugangsdaten, Parameter oder Anker enthalten.');
+  return (u.origin + u.pathname).replace(/\/+$/, '');
+}
+function cleanEntity(v) {
+  const t = str(v, 120).toLowerCase();
+  if (t && !ENTITY_RE.test(t)) throw new HttpError(400, `Ungültige Entität: ${t.slice(0, 60)}`);
+  return t;
+}
 
-  if (p === '/api/settings' && m === 'GET') return json(res, 200, publicSettings());
+/* Sitzungs-/Auth-Zustand */
+const ENV_PASSWORD = process.env.ADMIN_PASSWORD || '';
+let authRecord = db.auth || null;
+let setupCode = null;
+(async () => {
+  if (ENV_PASSWORD) {
+    if (ENV_PASSWORD.length < auth.MIN_PW) { console.error(`ADMIN_PASSWORD ist zu kurz (mind. ${auth.MIN_PW} Zeichen).`); process.exit(1); }
+    authRecord = await auth.hashPassword(ENV_PASSWORD);
+  } else if (!authRecord) {
+    setupCode = crypto.randomBytes(5).toString('hex');
+    console.log(`\n=== EINRICHTUNG ===\nNoch kein Passwort gesetzt. Einrichtungscode (nur in diesem Log sichtbar): ${setupCode}\nÖffne die Web-Oberfläche und lege dort das Passwort fest.\n===================\n`);
+  }
+})();
+
+function sessionOf(req) {
+  const tok = auth.parseCookies(req.headers.cookie)[COOKIE];
+  const sess = auth.getSession(tok);
+  return { tok, sess };
+}
+function sessionCookie(req, token, maxAge) {
+  return `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${isHttps(req) ? '; Secure' : ''}`;
+}
+/** Origin-Prüfung gegen CSRF bei schreibenden Anfragen. */
+function sameOrigin(req) {
+  const o = req.headers.origin;
+  if (!o) return true; // gleiche Herkunft ohne Origin-Header (SameSite=Strict schützt zusätzlich)
+  try { return new URL(o).host === req.headers.host; } catch { return false; }
+}
+
+async function authApi(req, res, p, m, ip) {
+  if (p === '/api/auth/state' && m === 'GET') {
+    const { sess } = sessionOf(req);
+    return json(req, res, 200, { setupRequired: !authRecord, authenticated: !!sess, csrf: sess ? sess.csrf : null, managedByEnv: !!ENV_PASSWORD });
+  }
+  if (p === '/api/auth/setup' && m === 'POST') {
+    if (authRecord) throw new HttpError(409, 'Passwort ist bereits gesetzt.');
+    const wait = auth.lockedFor(ip);
+    if (wait) throw new HttpError(429, `Zu viele Versuche. Bitte ${wait} s warten.`);
+    const b = await readBody(req);
+    if (!setupCode || !auth.safeEq(str(b.code, 40), setupCode)) { auth.recordFail(ip); throw new HttpError(403, 'Einrichtungscode falsch (siehe Container-Log).'); }
+    const pw = typeof b.password === 'string' ? b.password : '';
+    if (pw.length < auth.MIN_PW || pw.length > 200) throw new HttpError(400, `Passwort muss mindestens ${auth.MIN_PW} Zeichen lang sein.`);
+    authRecord = await auth.hashPassword(pw);
+    db.auth = authRecord; setupCode = null; save();
+    auth.clearFails(ip);
+    const { token, sess } = auth.createSession();
+    return json(req, res, 200, { ok: true, csrf: sess.csrf }, { 'Set-Cookie': sessionCookie(req, token, 7 * 86400) });
+  }
+  if (p === '/api/auth/login' && m === 'POST') {
+    const wait = auth.lockedFor(ip);
+    if (wait) throw new HttpError(429, `Zu viele Fehlversuche. Bitte ${Math.ceil(wait / 60)} Min. warten.`);
+    const b = await readBody(req);
+    const ok = authRecord && await auth.verifyPassword(typeof b.password === 'string' ? b.password.slice(0, 200) : '', authRecord);
+    if (!ok) { auth.recordFail(ip); throw new HttpError(401, 'Passwort falsch.'); }
+    auth.clearFails(ip);
+    const { token, sess } = auth.createSession();
+    return json(req, res, 200, { ok: true, csrf: sess.csrf }, { 'Set-Cookie': sessionCookie(req, token, 7 * 86400) });
+  }
+  if (p === '/api/auth/logout' && m === 'POST') {
+    const { tok, sess } = sessionOf(req);
+    if (sess && req.headers['x-csrf-token'] === sess.csrf) auth.destroySession(tok);
+    return json(req, res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, '', 0) });
+  }
+  return null;
+}
+
+let calcCache = new Map(), calcRunning = 0;
+
+async function api(req, res, url, ip) {
+  const p = url.pathname, m = req.method;
+
+  if (p === '/api/health') return json(req, res, 200, { ok: true });
+  if (m !== 'GET' && m !== 'HEAD' && !sameOrigin(req)) throw new HttpError(403, 'Ungültige Herkunft');
+
+  if (p.startsWith('/api/auth/')) {
+    const r = await authApi(req, res, p, m, ip);
+    if (r !== null) return r;
+    throw new HttpError(404, 'Nicht gefunden');
+  }
+
+  // ab hier nur mit gültiger Sitzung
+  const { tok, sess } = sessionOf(req);
+  if (!sess) throw new HttpError(401, 'Nicht angemeldet');
+  if (m !== 'GET' && m !== 'HEAD' && !auth.safeEq(req.headers['x-csrf-token'] || '', sess.csrf)) throw new HttpError(403, 'CSRF-Token ungültig');
+
+  if (p === '/api/settings' && m === 'GET') return json(req, res, 200, publicSettings());
   if (p === '/api/settings' && m === 'PUT') {
     const b = await readBody(req);
     const s = db.settings;
-    if (b.pricePerKwh !== undefined) s.pricePerKwh = Math.max(0, num(b.pricePerKwh, s.pricePerKwh));
-    if (b.basePriceYear !== undefined) s.basePriceYear = Math.max(0, num(b.basePriceYear, 0));
-    for (const k of ['haUrl', 'entityPower', 'entityVoltage', 'entityCurrent', 'measureStart', 'measureEnd']) {
-      if (typeof b[k] === 'string') s[k] = k === 'haUrl' ? normalizeUrl(b[k]) : b[k].trim();
+    if (b.pricePerKwh !== undefined) s.pricePerKwh = Math.min(100, Math.max(0, num(b.pricePerKwh, s.pricePerKwh)));
+    if (b.basePriceYear !== undefined) s.basePriceYear = Math.min(100000, Math.max(0, num(b.basePriceYear, 0)));
+    for (const k of ['measureStart', 'measureEnd']) {
+      if (typeof b[k] === 'string') { if (b[k] && !LOCAL_DT.test(b[k])) throw new HttpError(400, 'Ungültiges Datum.'); s[k] = b[k]; }
     }
-    if (typeof b.haToken === 'string' && b.haToken.trim()) s.haToken = b.haToken.trim();
-    if (b.clearToken) s.haToken = '';
-    for (const k of ['smtpHost', 'smtpUser', 'smtpFrom', 'smtpTo']) if (typeof b[k] === 'string') s[k] = b[k].replace(/[\r\n]/g, ' ').trim();
-    if (typeof b.smtpPass === 'string' && b.smtpPass) s.smtpPass = b.smtpPass;
-    if (b.clearSmtpPass) s.smtpPass = '';
+    // Home Assistant: bei geänderter URL muss der Token neu eingegeben werden (kein Token-Leak an fremde Hosts)
+    if (typeof b.haUrl === 'string') {
+      const nu = cleanHaUrl(b.haUrl);
+      if (nu !== s.haUrl) { s.haUrl = nu; if (!(typeof b.haToken === 'string' && b.haToken.trim())) s.haToken = ''; }
+    }
+    for (const k of ['entityPower', 'entityVoltage', 'entityCurrent']) if (typeof b[k] === 'string') s[k] = cleanEntity(b[k]);
+    if (typeof b.haToken === 'string' && b.haToken.trim()) s.haToken = b.haToken.trim().slice(0, 4096);
+    if (b.clearToken === true) s.haToken = '';
+    // SMTP: bei geändertem Server muss das Passwort neu eingegeben werden
+    if (typeof b.smtpHost === 'string') {
+      const h = str(b.smtpHost, 253).toLowerCase();
+      if (h && !HOST_RE.test(h)) throw new HttpError(400, 'SMTP-Server ist ungültig.');
+      if (h !== s.smtpHost) { s.smtpHost = h; if (!(typeof b.smtpPass === 'string' && b.smtpPass)) s.smtpPass = ''; }
+    }
+    for (const k of ['smtpUser']) if (typeof b[k] === 'string') s[k] = str(b[k], 200);
+    for (const k of ['smtpFrom', 'smtpTo']) if (typeof b[k] === 'string') {
+      const v = str(b[k], 500);
+      if (v && !v.split(/[,;\s]+/).filter(Boolean).every((x) => EMAIL_RE.test(x))) throw new HttpError(400, 'E-Mail-Adresse ungültig.');
+      s[k] = v;
+    }
+    if (typeof b.smtpPass === 'string' && b.smtpPass) s.smtpPass = b.smtpPass.slice(0, 500);
+    if (b.clearSmtpPass === true) s.smtpPass = '';
     if (b.smtpPort !== undefined) { const n = Math.round(num(b.smtpPort, 465)); s.smtpPort = n > 0 && n < 65536 ? n : 465; }
     for (const k of ['smtpVerify', 'alertsEnabled']) if (typeof b[k] === 'boolean') s[k] = b[k];
     if (typeof b.alertTime === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(b.alertTime)) s.alertTime = b.alertTime;
-    if (b.alertDayPct !== undefined) s.alertDayPct = Math.max(1, num(b.alertDayPct, s.alertDayPct));
-    if (b.alertMonthPct !== undefined) s.alertMonthPct = Math.max(1, num(b.alertMonthPct, s.alertMonthPct));
-    if (b.alertMinKwh !== undefined) s.alertMinKwh = Math.max(0, num(b.alertMinKwh, s.alertMinKwh));
+    if (b.alertDayPct !== undefined) s.alertDayPct = Math.min(10000, Math.max(1, num(b.alertDayPct, s.alertDayPct)));
+    if (b.alertMonthPct !== undefined) s.alertMonthPct = Math.min(10000, Math.max(1, num(b.alertMonthPct, s.alertMonthPct)));
+    if (b.alertMinKwh !== undefined) s.alertMinKwh = Math.min(1000, Math.max(0, num(b.alertMinKwh, s.alertMinKwh)));
     save();
-    return json(res, 200, publicSettings());
+    calcCache.clear();
+    return json(req, res, 200, publicSettings());
   }
 
   if (p === '/api/history' && m === 'GET') {
-    return json(res, 200, [...db.history].sort((a, b) => (b.to || '').localeCompare(a.to || '')));
+    return json(req, res, 200, [...db.history].sort((a, b) => (b.to || '').localeCompare(a.to || '')));
   }
   if (p === '/api/history' && m === 'POST') {
     const b = await readBody(req);
     const kwh = num(b.kwh, NaN);
-    if (!b.label || !Number.isFinite(kwh) || kwh <= 0) return json(res, 400, { error: 'Bezeichnung und kWh (> 0) sind nötig.' });
-    const entry = {
-      id: crypto.randomUUID(),
-      label: String(b.label).trim().slice(0, 80),
-      from: String(b.from || ''),
-      to: String(b.to || ''),
-      kwh,
-      note: String(b.note || '').trim().slice(0, 200),
-    };
+    const label = str(b.label, 80);
+    if (!label || !Number.isFinite(kwh) || kwh <= 0 || kwh > 1e7) return json(req, res, 400, { error: 'Bezeichnung und kWh (> 0) sind nötig.' });
+    const d = (v) => { const t = str(v, 10); if (t && !/^\d{4}-\d{2}-\d{2}$/.test(t)) throw new HttpError(400, 'Ungültiges Datum.'); return t; };
+    if (db.history.length >= 500) throw new HttpError(400, 'Maximal 500 Einträge.');
+    const entry = { id: crypto.randomUUID(), label, from: d(b.from), to: d(b.to), kwh, note: str(b.note, 200) };
     db.history.push(entry);
     save();
-    return json(res, 201, entry);
+    return json(req, res, 201, entry);
   }
-  const hm = p.match(/^\/api\/history\/([\w-]+)$/);
+  const hm = p.match(/^\/api\/history\/([\w-]{1,64})$/);
   if (hm && m === 'DELETE') {
     db.history = db.history.filter((e) => e.id !== hm[1]);
     save();
-    return json(res, 200, { ok: true });
+    return json(req, res, 200, { ok: true });
   }
 
   if (p === '/api/ha/test' && m === 'POST') {
     const s = db.settings;
     const b = await readBody(req);
-    const url = typeof b.haUrl === 'string' && b.haUrl ? b.haUrl : s.haUrl;
-    const token = typeof b.haToken === 'string' && b.haToken ? b.haToken : s.haToken;
-    if (!url || !token) return json(res, 400, { error: 'URL und Token fehlen.' });
+    const url = typeof b.haUrl === 'string' && b.haUrl ? cleanHaUrl(b.haUrl) : s.haUrl;
+    const newTok = typeof b.haToken === 'string' && b.haToken.trim() ? b.haToken.trim() : '';
+    // gespeicherter Token wird nur an die gespeicherte URL gesendet
+    if (!newTok && url !== s.haUrl) return json(req, res, 400, { error: 'Bei geänderter URL bitte den Token neu eingeben.' });
+    const token = newTok || s.haToken;
+    if (!url || !token) return json(req, res, 400, { error: 'URL und Token fehlen.' });
     try {
       await haFetch(url, token, '/api/', 8000);
       const out = {};
-      for (const [k, id] of Object.entries({ power: b.entityPower ?? s.entityPower, voltage: b.entityVoltage ?? s.entityVoltage, current: b.entityCurrent ?? s.entityCurrent })) {
+      for (const [k, raw] of Object.entries({ power: b.entityPower ?? s.entityPower, voltage: b.entityVoltage ?? s.entityVoltage, current: b.entityCurrent ?? s.entityCurrent })) {
+        const id = cleanEntity(raw);
         if (!id) continue;
         try {
           const st = await haFetch(url, token, `/api/states/${encodeURIComponent(id)}`, 8000);
-          out[k] = { ok: true, state: st.state, unit: st.attributes?.unit_of_measurement || '' };
+          out[k] = { ok: true, state: String(st.state).slice(0, 40), unit: String(st.attributes?.unit_of_measurement || '').slice(0, 10) };
         } catch (e) { out[k] = { ok: false, error: e.message }; }
       }
-      return json(res, 200, { ok: true, entities: out });
+      return json(req, res, 200, { ok: true, entities: out });
     } catch (e) {
-      return json(res, 200, { ok: false, error: e.cause?.code ? `${e.message} (${e.cause.code})` : e.message });
+      return json(req, res, 200, { ok: false, error: e.cause?.code ? `${e.message} (${e.cause.code})` : e.message });
     }
   }
 
   if (p === '/api/mail/test' && m === 'POST') {
     const b = await readBody(req);
     try {
-      await deliver(smtpConfig(mergeSmtp(b)), buildTestMail());
-      return json(res, 200, { ok: true });
-    } catch (e) { return json(res, 200, { ok: false, error: e.message }); }
+      const cfg = mergeSmtp(b);
+      if (cfg.error) return json(req, res, 200, { ok: false, error: cfg.error });
+      await deliver(smtpConfig(cfg), buildTestMail());
+      return json(req, res, 200, { ok: true });
+    } catch (e) { return json(req, res, 200, { ok: false, error: e.message }); }
   }
 
-  if (p === '/api/alerts' && m === 'GET') return json(res, 200, { log: db.alerts, state: db.alertState });
+  if (p === '/api/alerts' && m === 'GET') return json(req, res, 200, { log: db.alerts, state: { lastError: db.alertState.lastError || null } });
   if (p === '/api/alerts/check' && m === 'POST') {
     const b = await readBody(req);
-    try { return json(res, 200, await runAlertCheck({ send: !!b.send, force: true })); }
-    catch (e) { return json(res, 400, { error: e.message }); }
+    try { return json(req, res, 200, await runAlertCheck({ send: b.send === true, force: true })); }
+    catch (e) { return json(req, res, 400, { error: e.message }); }
   }
 
   if (p === '/api/calc' && m === 'GET') {
+    const start = url.searchParams.get('start') || '', end = url.searchParams.get('end') || '';
+    if (!LOCAL_DT.test(start) || (end && !LOCAL_DT.test(end))) throw new HttpError(400, 'Ungültiges Datumsformat.');
+    const refKwh = Math.min(1e7, Math.max(0, num(url.searchParams.get('refKwh'), 0)));
+    if ((end ? new Date(end) : new Date()) - new Date(start) > MAX_RANGE_DAYS * 86400e3) throw new HttpError(400, `Zeitraum darf höchstens ${MAX_RANGE_DAYS} Tage umfassen.`);
+    const key = `${start}|${end}|${refKwh}`;
+    const hit = calcCache.get(key);
+    if (hit && Date.now() - hit.t < 20000) return json(req, res, 200, hit.v);
+    if (calcRunning >= 2) throw new HttpError(429, 'Es laufen bereits Berechnungen – bitte kurz warten.');
+    calcRunning++;
     try {
-      const r = await calculate({
-        start: url.searchParams.get('start'),
-        end: url.searchParams.get('end'),
-        refKwh: num(url.searchParams.get('refKwh'), 0),
-      });
-      return json(res, 200, r);
+      const r = await calculate({ start, end, refKwh });
+      if (calcCache.size > 50) calcCache.clear();
+      calcCache.set(key, { t: Date.now(), v: r });
+      return json(req, res, 200, r);
     } catch (e) {
-      return json(res, 400, { error: e.cause?.code ? `${e.message} (${e.cause.code})` : e.message });
-    }
+      return json(req, res, 400, { error: e.cause?.code ? `${e.message} (${e.cause.code})` : e.message });
+    } finally { calcRunning--; }
   }
-  return json(res, 404, { error: 'Not found' });
+  throw new HttpError(404, 'Nicht gefunden');
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://x');
+  const ip = clientIp(req);
   try {
-    if (url.pathname.startsWith('/api/')) return await api(req, res, url);
-    let f = path.normalize(path.join(PUBLIC, url.pathname === '/' ? 'index.html' : url.pathname));
-    if (!f.startsWith(PUBLIC) || !fs.existsSync(f) || fs.statSync(f).isDirectory()) f = path.join(PUBLIC, 'index.html');
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(f)] || 'application/octet-stream' });
-    fs.createReadStream(f).pipe(res);
+    if (!['GET', 'HEAD', 'POST', 'PUT', 'DELETE'].includes(req.method)) throw new HttpError(405, 'Methode nicht erlaubt');
+    if (!auth.rateLimit(ip)) throw new HttpError(429, 'Zu viele Anfragen');
+    const url = new URL(req.url, 'http://x');
+    if (url.pathname.startsWith('/api/')) {
+      if (url.pathname === '/api/auth/password' && req.method === 'POST') return await changePassword(req, res);
+      return await api(req, res, url, ip);
+    }
+    const hit = STATIC[url.pathname];
+    if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'Methode nicht erlaubt');
+    const file = hit ? STATIC_CACHE[url.pathname] : STATIC_CACHE['/']; // SPA-Fallback
+    const type = hit ? hit[1] : STATIC['/'][1];
+    return send(req, res, 200, req.method === 'HEAD' ? '' : file, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
   } catch (e) {
-    json(res, 500, { error: e.message });
+    if (e instanceof HttpError) return json(req, res, e.code, { error: e.message });
+    console.error('Fehler:', e.message);
+    return json(req, res, 500, { error: 'Interner Fehler' });
   }
 });
+
+async function changePassword(req, res) {
+  const { tok, sess } = sessionOf(req);
+  if (!sess) throw new HttpError(401, 'Nicht angemeldet');
+  if (!sameOrigin(req) || !auth.safeEq(req.headers['x-csrf-token'] || '', sess.csrf)) throw new HttpError(403, 'CSRF-Token ungültig');
+  if (ENV_PASSWORD) throw new HttpError(400, 'Das Passwort wird über ADMIN_PASSWORD verwaltet.');
+  const ip = clientIp(req);
+  const wait = auth.lockedFor(ip);
+  if (wait) throw new HttpError(429, `Zu viele Fehlversuche. Bitte ${Math.ceil(wait / 60)} Min. warten.`);
+  const b = await readBody(req);
+  if (!(await auth.verifyPassword(typeof b.current === 'string' ? b.current.slice(0, 200) : '', authRecord))) { auth.recordFail(ip); throw new HttpError(403, 'Aktuelles Passwort falsch.'); }
+  const pw = typeof b.password === 'string' ? b.password : '';
+  if (pw.length < auth.MIN_PW || pw.length > 200) throw new HttpError(400, `Neues Passwort muss mindestens ${auth.MIN_PW} Zeichen lang sein.`);
+  authRecord = await auth.hashPassword(pw);
+  db.auth = authRecord; save();
+  auth.destroyAllExcept(tok);
+  return json(req, res, 200, { ok: true });
+}
+
+server.headersTimeout = 15000;
+server.requestTimeout = 30000;
+server.keepAliveTimeout = 5000;
+server.maxRequestsPerSocket = 200;
+process.on('unhandledRejection', (e) => console.error('Unhandled:', e && e.message));
 server.listen(PORT, () => console.log(`Stromrechner läuft auf Port ${PORT} (TZ=${process.env.TZ || 'system'})`));
