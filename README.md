@@ -29,7 +29,8 @@ Bei Überschreitung der Schwellen (Prozent und Mindest-Mehrverbrauch) geht eine 
 (Grundlast, Laufzeit, Spitzenleistung, Zeitfenster) ist regelbasiert, ohne KI.
 
 ## Dashboard
-Die Auswertung lädt sofort beim Öffnen. Zeitraum per Schnellwahl (Heute, 7 Tage, 30 Tage, Dieser Monat,
+Die Auswertung lädt sofort beim Öffnen und zeigt standardmäßig **Gesamt** (alle Daten ab der ersten Messung,
+mit Monatsdiagramm und Monatsübersicht). Zeitraum per Schnellwahl (Gesamt, Heute, 7 Tage, 30 Tage, Dieser Monat,
 Dieses Jahr) oder „Eigener Zeitraum“; läuft der Zeitraum bis „jetzt“, aktualisiert sich die Seite jede Minute.
 
 ## Sicherheit und Verschlüsselung

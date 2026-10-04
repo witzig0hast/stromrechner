@@ -187,6 +187,19 @@ async function fetchEntity(s, entity, start, end) {
   return { pts, source: 'statistics' };
 }
 
+/** Frühester Zeitpunkt mit Statistikdaten (Monat → Tag → Stunde eingrenzen). */
+async function earliestData(s) {
+  const q = (period, a, b) => haWs(s.haUrl, s.haToken, [{ type: 'recorder/statistics_during_period', start_time: new Date(a).toISOString(), end_time: new Date(b).toISOString(), statistic_ids: [s.entityPower], period, types: ['mean'] }])
+    .then(([r]) => (r?.[s.entityPower] || []).filter((x) => x.mean != null).map((x) => toMs(x.start)).sort((x, y) => x - y)[0] ?? null);
+  const now = Date.now();
+  const month = await q('month', Date.UTC(2015, 0, 1), now);
+  if (month === null) return null;
+  const day = await q('day', month, Math.min(now, month + 40 * DAY));
+  if (day === null) return month;
+  return (await q('hour', day, Math.min(now, day + 2 * DAY))) ?? day;
+}
+const localStr = (ms) => { const d = new Date(ms), p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; };
+
 /* ---------- Berechnung ---------- */
 
 async function calculate({ start, end, refKwh }) {
@@ -409,6 +422,7 @@ const ENTITY_RE = /^[a-z0-9_]+\.[a-z0-9_]+$/;
 const HOST_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]*[a-z0-9])?$|^\[[0-9a-f:]+\]$/i;
 const LOCAL_DT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
 const MAX_RANGE_DAYS = 800;
+const MAX_ALL_DAYS = 1830; // „Gesamt“ maximal 5 Jahre
 
 /** HA-URL prüfen: nur http(s), keine Zugangsdaten/Query. Gibt normalisierte URL oder wirft. */
 function cleanHaUrl(v) {
@@ -553,17 +567,29 @@ async function api(req, res, url, ip) {
   }
 
   if (p === '/api/calc' && m === 'GET') {
-    const start = url.searchParams.get('start') || '', end = url.searchParams.get('end') || '';
-    if (!LOCAL_DT.test(start) || (end && !LOCAL_DT.test(end))) throw new HttpError(400, 'Ungültiges Datumsformat.');
+    let start = url.searchParams.get('start') || '';
+    const end = url.searchParams.get('end') || '';
+    const all = start === 'all'; // „Gesamt“: ab der ersten vorhandenen Messung
+    if ((!all && !LOCAL_DT.test(start)) || (end && !LOCAL_DT.test(end))) throw new HttpError(400, 'Ungültiges Datumsformat.');
+    let rangeNote = '';
+    if (all) {
+      const s0 = db.settings;
+      if (!s0.haUrl || !s0.haToken || !s0.entityPower) throw new HttpError(400, 'Home Assistant ist noch nicht konfiguriert (Einstellungen).');
+      const first = await earliestData(s0).catch(() => null);
+      if (first === null) { start = localStr(Date.now() - 90 * DAY); rangeNote = 'Keine Langzeitstatistik gefunden – es werden die letzten 90 Tage gezeigt.'; }
+      else start = localStr(Math.max(first, Date.now() - MAX_ALL_DAYS * DAY));
+    }
     const refKwh = Math.min(1e7, Math.max(0, num(url.searchParams.get('refKwh'), 0)));
-    if ((end ? new Date(end) : new Date()) - new Date(start) > MAX_RANGE_DAYS * 86400e3) throw new HttpError(400, `Zeitraum darf höchstens ${MAX_RANGE_DAYS} Tage umfassen.`);
-    const key = `${start}|${end}|${refKwh}`;
+    if (!all && (end ? new Date(end) : new Date()) - new Date(start) > MAX_RANGE_DAYS * 86400e3) throw new HttpError(400, `Zeitraum darf höchstens ${MAX_RANGE_DAYS} Tage umfassen.`);
+    const key = `${all ? 'all' : start}|${end}|${refKwh}`;
     const hit = calcCache.get(key);
     if (hit && Date.now() - hit.t < 20000) return json(req, res, 200, hit.v);
     if (calcRunning >= 2) throw new HttpError(429, 'Es laufen bereits Berechnungen – bitte kurz warten.');
     calcRunning++;
     try {
       const r = await calculate({ start, end, refKwh });
+      r.rangeNote = rangeNote;
+      r.allData = all;
       if (calcCache.size > 50) calcCache.clear();
       calcCache.set(key, { t: Date.now(), v: r });
       return json(req, res, 200, r);

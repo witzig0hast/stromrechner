@@ -28,10 +28,11 @@ const fmtDT = (iso) => new Date(iso).toLocaleString('de-DE', { dateStyle: 'mediu
 let refreshTimer = null;
 const p2 = (n) => String(n).padStart(2, '0');
 const dtLocal = (d) => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}T${p2(d.getHours())}:${p2(d.getMinutes())}`;
-const PRESETS = [['today', 'Heute'], ['7d', '7 Tage'], ['30d', '30 Tage'], ['month', 'Dieser Monat'], ['year', 'Dieses Jahr'], ['custom', 'Eigener Zeitraum']];
+const PRESETS = [['all', 'Gesamt'], ['today', 'Heute'], ['7d', '7 Tage'], ['30d', '30 Tage'], ['month', 'Dieser Monat'], ['year', 'Dieses Jahr'], ['custom', 'Eigener Zeitraum']];
 function presetRange(id, custom) {
   const n = new Date(), d0 = new Date(n.getFullYear(), n.getMonth(), n.getDate());
   const off = (days) => dtLocal(new Date(d0.getFullYear(), d0.getMonth(), d0.getDate() - days));
+  if (id === 'all') return { start: 'all', end: '' };
   if (id === 'today') return { start: dtLocal(d0), end: '' };
   if (id === '7d') return { start: off(6), end: '' };
   if (id === '30d') return { start: off(29), end: '' };
@@ -44,8 +45,8 @@ async function dashboard() {
   const [s, hist] = await Promise.all([api('/settings'), api('/history')]);
   const cur = s.currency;
   const configured = s.hasToken && s.haUrl && s.entityPower;
-  let preset = store.get('preset', s.measureStart ? 'custom' : '7d');
-  if (!PRESETS.some(([id]) => id === preset)) preset = '7d';
+  let preset = store.get('preset', 'all');
+  if (!PRESETS.some(([id]) => id === preset)) preset = 'all';
   const savedRef = store.get('ref', '');
   app.innerHTML = `
     <div class="head"><h1>Auswertung</h1>
@@ -88,7 +89,7 @@ async function dashboard() {
     try {
       const r = await api('/calc?' + new URLSearchParams({ start: range.start, end: range.end, refKwh: refKwh || 0 }));
       if (my !== seq) return;
-      status(r.coverage < 0.98 ? `<div class="msg warn">Nur ${nf(r.coverage * 100, 0)} % des Zeitraums (${nf(r.coveredHours, 1)} von ${nf(r.hours, 1)} Std.) haben Messwerte. Durchschnitt, Kosten pro Tag und Hochrechnung beziehen sich auf die gemessene Zeit.</div>` : '');
+      status((r.rangeNote ? `<div class="msg warn">${esc(r.rangeNote)}</div>` : '') + (r.coverage < 0.98 ? `<div class="msg warn">Nur ${nf(r.coverage * 100, 0)} % des Zeitraums (${nf(r.coveredHours, 1)} von ${nf(r.hours, 1)} Std.) haben Messwerte. Durchschnitt, Kosten pro Tag und Hochrechnung beziehen sich auf die gemessene Zeit.</div>` : ''));
       render(r, cur);
     } catch (e) {
       if (my !== seq) return;
@@ -156,7 +157,9 @@ function render(r, cur) {
       <div class="hint">Datenbasis: ${r.source === 'statistics' ? 'Mittelwerte der Home-Assistant-Statistik (5 Minuten, ältere Daten stündlich)' : 'Zustandsverlauf (keine Statistik für diese Entität vorhanden)'}. Jahreshochrechnung: ca. ${nf(r.projectedYearKwh, 0)} kWh.</div></div>
     </section>
     ${pct}
-    <section class="card"><div class="card-h"><h2>Verbrauch pro Tag</h2><span class="tag">kWh</span></div><div class="card-b">${chart(r.days)}</div></section>
+    ${r.days.length > 92 ? `<section class="card"><div class="card-h"><h2>Verbrauch pro Monat</h2><span class="tag">kWh</span></div><div class="card-b">${chart(monthRows(r.days))}</div></section>` : ''}
+    ${r.days.length > 31 ? `<section class="card"><div class="card-h"><h2>Monatsübersicht</h2></div><div class="card-b"><div class="tbl tall"><table><thead><tr><th>Monat</th><th class="r">Tage</th><th class="r">kWh</th><th class="r">Ø kWh/Tag</th><th class="r">Kosten</th></tr></thead><tbody>${monthRows(r.days).reverse().map((m) => `<tr><td>${esc(m.title)}</td><td class="r">${m.days}</td><td class="r">${nf(m.kwh, 2)}</td><td class="r">${nf(m.kwh / m.days, 2)}</td><td class="r">${nf(m.cost)} ${cur}</td></tr>`).join('')}</tbody></table></div></div></section>` : ''}
+    <section class="card"><div class="card-h"><h2>Verbrauch pro Tag${r.days.length > 92 ? ' (letzte 90 Tage)' : ''}</h2><span class="tag">kWh</span></div><div class="card-b">${chart(dayItems(r.days.slice(-90)))}</div></section>
     <section class="card"><div class="card-h"><h2>Tagesübersicht</h2></div><div class="card-b">
       <div class="tbl tall"><table><thead><tr><th>Datum</th><th class="r">kWh</th><th class="r">Kosten</th></tr></thead><tbody>
       ${[...r.days].reverse().map((d) => `<tr><td>${fmtDate(d.date)}</td><td class="r">${nf(d.kwh, 3)}</td><td class="r">${nf(d.cost)} ${cur}</td></tr>`).join('')}
@@ -164,23 +167,32 @@ function render(r, cur) {
   $('#out').querySelectorAll('[data-w]').forEach((e) => { e.style.width = e.dataset.w + '%'; });
 }
 
-function chart(days) {
-  if (!days.length) return '';
+function chart(items) {
+  if (!items.length) return '';
   const W = 1000, H = 240, pl = 44, pb = 26, pt = 10;
-  const max = Math.max(...days.map((d) => d.kwh), 0.001);
-  const bw = (W - pl) / days.length;
+  const max = Math.max(...items.map((d) => d.kwh), 0.001);
+  const bw = (W - pl) / items.length;
   const gap = Math.min(4, bw * 0.2);
   const grid = [0, .25, .5, .75, 1].map((f) => {
     const y = pt + (H - pt - pb) * (1 - f);
     return `<line x1="${pl}" x2="${W}" y1="${y}" y2="${y}"/><text x="${pl - 6}" y="${y + 4}" text-anchor="end">${nf(max * f, max < 1 ? 2 : 1)}</text>`;
   }).join('');
-  const step = Math.ceil(days.length / 12);
-  const bars = days.map((d, i) => {
+  const step = Math.ceil(items.length / 12);
+  const bars = items.map((d, i) => {
     const h = (H - pt - pb) * (d.kwh / max), x = pl + i * bw + gap / 2;
-    const lbl = i % step === 0 ? `<text x="${x + (bw - gap) / 2}" y="${H - 8}" text-anchor="middle">${d.date.slice(8)}.${d.date.slice(5, 7)}.</text>` : '';
-    return `<rect class="bar-r" x="${x}" y="${H - pb - h}" width="${Math.max(1, bw - gap)}" height="${h}" rx="2"><title>${fmtDate(d.date)}: ${nf(d.kwh, 3)} kWh</title></rect>${lbl}`;
+    const lbl = i % step === 0 ? `<text x="${x + (bw - gap) / 2}" y="${H - 8}" text-anchor="middle">${esc(d.label)}</text>` : '';
+    return `<rect class="bar-r" x="${x}" y="${H - pb - h}" width="${Math.max(1, bw - gap)}" height="${h}" rx="2"><title>${esc(d.title)}: ${nf(d.kwh, 3)} kWh</title></rect>${lbl}`;
   }).join('');
   return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${grid}${bars}</svg>`;
+}
+const dayItems = (days) => days.map((d) => ({ kwh: d.kwh, label: `${d.date.slice(8)}.${d.date.slice(5, 7)}.`, title: fmtDate(d.date) }));
+function monthRows(days) {
+  const m = new Map();
+  for (const d of days) {
+    const k = d.date.slice(0, 7), r = m.get(k) || { key: k, kwh: 0, cost: 0, days: 0 };
+    r.kwh += d.kwh; r.cost += d.cost; r.days += 1; m.set(k, r);
+  }
+  return [...m.values()].map((r) => ({ ...r, title: new Date(r.key + '-01T12:00').toLocaleDateString('de-DE', { month: 'long', year: 'numeric' }), label: `${r.key.slice(5)}/${r.key.slice(2, 4)}` }));
 }
 
 /* ---------------- Einstellungen ---------------- */
