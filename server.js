@@ -371,6 +371,11 @@ const STATIC = {
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
 };
 const STATIC_CACHE = Object.fromEntries(Object.entries(STATIC).map(([k, [f]]) => [k, fs.readFileSync(path.join(PUBLIC, f))]));
+// Cache-Busting: Version (Hash von JS+CSS) an die Asset-URLs hängen, damit Browser/Proxys (z. B. „Cache Assets“) nie veraltete Dateien ausliefern
+const ASSET_VERSION = crypto.createHash('sha256').update(STATIC_CACHE['/app.js']).update(STATIC_CACHE['/style.css']).digest('hex').slice(0, 12);
+const INDEX_HTML = Buffer.from(STATIC_CACHE['/'].toString('utf8').replace('href="style.css"', `href="style.css?v=${ASSET_VERSION}"`).replace('src="app.js"', `src="app.js?v=${ASSET_VERSION}"`));
+STATIC_CACHE['/'] = STATIC_CACHE['/index.html'] = INDEX_HTML;
+const ETAGS = Object.fromEntries(Object.entries(STATIC_CACHE).map(([k, v]) => [k, `"${crypto.createHash('sha256').update(v).digest('hex').slice(0, 16)}"`]));
 
 const SEC_HEADERS = {
   'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
@@ -616,7 +621,12 @@ const handler = async (req, res) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'Methode nicht erlaubt');
     const file = hit ? STATIC_CACHE[url.pathname] : STATIC_CACHE['/']; // SPA-Fallback
     const type = hit ? hit[1] : STATIC['/'][1];
-    return send(req, res, 200, req.method === 'HEAD' ? '' : file, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
+    const isHtml = type.startsWith('text/html');
+    const etag = hit ? ETAGS[url.pathname] : ETAGS['/'];
+    // HTML nie cachen; Assets nur mit Revalidierung
+    const cc = { 'Content-Type': type, 'Cache-Control': isHtml ? 'no-store' : 'no-cache, must-revalidate', ETag: etag };
+    if (!isHtml && req.headers['if-none-match'] === etag) return send(req, res, 304, '', cc);
+    return send(req, res, 200, req.method === 'HEAD' ? '' : file, cc);
   } catch (e) {
     if (e instanceof HttpError) return json(req, res, e.code, { error: e.message });
     console.error('Fehler:', e.message);
