@@ -59,10 +59,10 @@ function lockedFor(ip) {
   const f = fails.get(ip);
   return f && f.until > Date.now() ? Math.ceil((f.until - Date.now()) / 1000) : 0;
 }
-function recordFail(ip) {
+function recordFail(ip, limit = 5) {
   const f = fails.get(ip) || { n: 0, until: 0 };
   f.n += 1;
-  if (f.n >= 5) { f.until = Date.now() + 15 * 60e3; f.n = 0; }
+  if (f.n >= limit) { f.until = Date.now() + 15 * 60e3; f.n = 0; }
   fails.set(ip, f);
 }
 const clearFails = (ip) => fails.delete(ip);

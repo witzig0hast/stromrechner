@@ -295,7 +295,16 @@ setInterval(() => scheduler().catch((e) => console.error(e)), 60000);
 
 /* ---------- HTTP ---------- */
 
-const TRUST_PROXY = process.env.TRUST_PROXY === '1';
+/**
+ * Reverse-Proxy-Erkennung (TRUST_PROXY): "auto" (Standard) vertraut X-Forwarded-* nur, wenn die direkte
+ * Verbindung von einer lokalen/privaten Adresse kommt (typisch: Proxy im Docker-/Heimnetz).
+ * "1" vertraut immer, "0" nie.
+ */
+const TRUST_MODE = (process.env.TRUST_PROXY || 'auto').toLowerCase();
+const PRIVATE_RE = /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|::1$|f[cd][0-9a-f]{2}:|fe80:|::ffff:(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.))/i;
+const peerIp = (req) => req.socket.remoteAddress || 'unknown';
+const trusted = (req) => TRUST_MODE === '1' || TRUST_MODE === 'true' || (TRUST_MODE === 'auto' && PRIVATE_RE.test(peerIp(req)));
+const fwd = (req, name) => String(req.headers[name] || '').split(',').map((x) => x.trim()).filter(Boolean);
 const COOKIE = 'sr_session';
 const STATIC = {
   '/': ['index.html', 'text/html; charset=utf-8'],
@@ -314,8 +323,12 @@ const SEC_HEADERS = {
   'Cross-Origin-Resource-Policy': 'same-origin',
   'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
 };
-const isHttps = (req) => !!req.socket.encrypted || (TRUST_PROXY && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https');
-const clientIp = (req) => (TRUST_PROXY && req.headers['x-forwarded-for'] ? String(req.headers['x-forwarded-for']).split(',').pop().trim() : req.socket.remoteAddress) || 'unknown';
+const isHttps = (req) => !!req.socket.encrypted || (trusted(req) && fwd(req, 'x-forwarded-proto')[0] === 'https');
+const clientIp = (req) => (trusted(req) ? fwd(req, 'x-forwarded-for').pop() : null) || peerIp(req);
+/* Sperre zählt pro Client-IP (5 Versuche) und zusätzlich pro Proxy-Verbindung (30), damit gefälschte Header nicht helfen */
+const lockWait = (req) => Math.max(auth.lockedFor(clientIp(req)), auth.lockedFor('peer:' + peerIp(req)));
+const lockFail = (req) => { auth.recordFail(clientIp(req)); auth.recordFail('peer:' + peerIp(req), 30); };
+const lockClear = (req) => auth.clearFails(clientIp(req));
 
 function send(req, res, code, body, headers = {}) {
   const h = { ...SEC_HEADERS, ...headers };
@@ -389,7 +402,11 @@ function sessionCookie(req, token, maxAge) {
 function sameOrigin(req) {
   const o = req.headers.origin;
   if (!o) return true; // gleiche Herkunft ohne Origin-Header (SameSite=Strict schützt zusätzlich)
-  try { return new URL(o).host === req.headers.host; } catch { return false; }
+  let host;
+  try { host = new URL(o).host; } catch { return false; }
+  const allowed = [req.headers.host];
+  if (trusted(req)) allowed.push(fwd(req, 'x-forwarded-host')[0]);
+  return allowed.includes(host);
 }
 
 async function authApi(req, res, p, m, ip) {
@@ -399,25 +416,25 @@ async function authApi(req, res, p, m, ip) {
   }
   if (p === '/api/auth/setup' && m === 'POST') {
     if (authRecord) throw new HttpError(409, 'Passwort ist bereits gesetzt.');
-    const wait = auth.lockedFor(ip);
+    const wait = lockWait(req);
     if (wait) throw new HttpError(429, `Zu viele Versuche. Bitte ${wait} s warten.`);
     const b = await readBody(req);
-    if (!setupCode || !auth.safeEq(str(b.code, 40), setupCode)) { auth.recordFail(ip); throw new HttpError(403, 'Einrichtungscode falsch (siehe Container-Log).'); }
+    if (!setupCode || !auth.safeEq(str(b.code, 40), setupCode)) { lockFail(req); throw new HttpError(403, 'Einrichtungscode falsch (siehe Container-Log).'); }
     const pw = typeof b.password === 'string' ? b.password : '';
     if (pw.length < auth.MIN_PW || pw.length > 200) throw new HttpError(400, `Passwort muss mindestens ${auth.MIN_PW} Zeichen lang sein.`);
     authRecord = await auth.hashPassword(pw);
     db.auth = authRecord; setupCode = null; save();
-    auth.clearFails(ip);
+    lockClear(req);
     const { token, sess } = auth.createSession();
     return json(req, res, 200, { ok: true, csrf: sess.csrf }, { 'Set-Cookie': sessionCookie(req, token, 7 * 86400) });
   }
   if (p === '/api/auth/login' && m === 'POST') {
-    const wait = auth.lockedFor(ip);
+    const wait = lockWait(req);
     if (wait) throw new HttpError(429, `Zu viele Fehlversuche. Bitte ${Math.ceil(wait / 60)} Min. warten.`);
     const b = await readBody(req);
     const ok = authRecord && await auth.verifyPassword(typeof b.password === 'string' ? b.password.slice(0, 200) : '', authRecord);
-    if (!ok) { auth.recordFail(ip); throw new HttpError(401, 'Passwort falsch.'); }
-    auth.clearFails(ip);
+    if (!ok) { lockFail(req); throw new HttpError(401, 'Passwort falsch.'); }
+    lockClear(req);
     const { token, sess } = auth.createSession();
     return json(req, res, 200, { ok: true, csrf: sess.csrf }, { 'Set-Cookie': sessionCookie(req, token, 7 * 86400) });
   }
@@ -605,10 +622,10 @@ async function changePassword(req, res) {
   if (!sameOrigin(req) || !auth.safeEq(req.headers['x-csrf-token'] || '', sess.csrf)) throw new HttpError(403, 'CSRF-Token ungültig');
   if (ENV_PASSWORD) throw new HttpError(400, 'Das Passwort wird über ADMIN_PASSWORD verwaltet.');
   const ip = clientIp(req);
-  const wait = auth.lockedFor(ip);
+  const wait = lockWait(req);
   if (wait) throw new HttpError(429, `Zu viele Fehlversuche. Bitte ${Math.ceil(wait / 60)} Min. warten.`);
   const b = await readBody(req);
-  if (!(await auth.verifyPassword(typeof b.current === 'string' ? b.current.slice(0, 200) : '', authRecord))) { auth.recordFail(ip); throw new HttpError(403, 'Aktuelles Passwort falsch.'); }
+  if (!(await auth.verifyPassword(typeof b.current === 'string' ? b.current.slice(0, 200) : '', authRecord))) { lockFail(req); throw new HttpError(403, 'Aktuelles Passwort falsch.'); }
   const pw = typeof b.password === 'string' ? b.password : '';
   if (pw.length < auth.MIN_PW || pw.length > 200) throw new HttpError(400, `Neues Passwort muss mindestens ${auth.MIN_PW} Zeichen lang sein.`);
   authRecord = await auth.hashPassword(pw);

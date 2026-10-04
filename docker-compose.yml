@@ -10,8 +10,9 @@ services:
       # Optional: Passwort fest vorgeben (min. 10 Zeichen). Ohne Angabe erscheint beim ersten Start
       # ein Einrichtungscode im Container-Log (docker compose logs stromrechner).
       # ADMIN_PASSWORD: "bitte-ein-langes-passwort"
-      # Nur setzen, wenn ein vertrauenswürdiger Reverse-Proxy X-Forwarded-* setzt:
-      # TRUST_PROXY: "1"
+      # Reverse-Proxy (Caddy, nginx, Traefik …) wird automatisch erkannt: X-Forwarded-* wird akzeptiert,
+      # wenn die Verbindung von einer privaten/lokalen Adresse kommt. Optional: "1" = immer, "0" = nie.
+      # TRUST_PROXY: "auto"
     volumes:
       - stromrechner-data:/data
     read_only: true

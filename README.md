@@ -44,5 +44,7 @@ Dieses Jahr) oder „Eigener Zeitraum“; läuft der Zeitraum bis „jetzt“, a
 - Container: Non-Root, read-only Dateisystem, alle Capabilities entfernt, `no-new-privileges`, Ressourcenlimits
 - Daten liegen in `/data/db.json` (Rechte 0600) – das Volume wie ein Geheimnis behandeln (Backups!).
 
-Für Zugriff über das Internet: HTTPS-Reverse-Proxy (z. B. Caddy/Traefik/nginx) davorsetzen und `TRUST_PROXY=1` setzen.
+Für Zugriff über das Internet: HTTPS-Reverse-Proxy (z. B. Caddy/Traefik/nginx) davorsetzen. Proxys werden automatisch erkannt
+(`X-Forwarded-For/-Proto/-Host` werden akzeptiert, wenn die Verbindung von einer privaten/lokalen Adresse kommt;
+`TRUST_PROXY=1` erzwingt es, `0` schaltet es ab). Der Proxy sollte `X-Forwarded-Proto` setzen, damit der Cookie `Secure` wird.
 Ohne HTTPS wird das Passwort im Klartext übertragen – nur im vertrauenswürdigen Heimnetz betreiben.
