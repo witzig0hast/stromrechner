@@ -445,15 +445,15 @@ function cleanEntity(v) {
   return t;
 }
 
-/** Origin-Prüfung gegen CSRF bei schreibenden Anfragen. */
+/**
+ * CSRF-Schutz bei schreibenden Anfragen, unabhängig von Proxy/Host-Header:
+ * - eigener Header X-Requested-With (Browser dürfen ihn Cross-Origin nur per CORS-Preflight senden, den wir nie erlauben)
+ * - Sec-Fetch-Site vom Browser darf nicht cross-site/same-site sein
+ */
 function sameOrigin(req) {
-  const o = req.headers.origin;
-  if (!o) return true; // gleiche Herkunft ohne Origin-Header (SameSite=Strict schützt zusätzlich)
-  let host;
-  try { host = new URL(o).host; } catch { return false; }
-  const allowed = [req.headers.host];
-  if (trusted(req)) allowed.push(fwd(req, 'x-forwarded-host')[0]);
-  return allowed.includes(host);
+  const sfs = req.headers['sec-fetch-site'];
+  if (sfs === 'cross-site' || sfs === 'same-site') return false;
+  return req.headers['x-requested-with'] === 'stromrechner';
 }
 
 let calcCache = new Map(), calcRunning = 0;

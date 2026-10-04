@@ -43,6 +43,6 @@ Dieses Jahr) oder „Eigener Zeitraum“; läuft der Zeitraum bis „jetzt“, a
 - **Kein Login:** Die Oberfläche ist ohne Anmeldung erreichbar – betreibe sie nur im vertrauenswürdigen Netz oder hinter einem
   Proxy mit eigener Authentifizierung. Optional `ALLOWED_HOSTS` gegen DNS-Rebinding.
 - Geheimnisse werden nie an den Browser gesendet; bei geänderter URL/Server müssen sie neu eingegeben werden.
-- Schreibende Anfragen: JSON-Pflicht + Origin-Prüfung (CSRF). Strenge CSP, `X-Frame-Options`, `nosniff`.
+- Schreibende Anfragen: JSON-Pflicht + eigener Header + Sec-Fetch-Site-Prüfung (CSRF, funktioniert hinter jedem Proxy). Strenge CSP, `X-Frame-Options`, `nosniff`.
 - Eingabevalidierung (URL, Entitäten, Datum, E-Mail), Größen-/Zeitraumlimits, Rate-Limit.
 - Container: Non-Root, read-only Dateisystem, keine Capabilities, `no-new-privileges`, Ressourcenlimits.

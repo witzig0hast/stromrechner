@@ -6,7 +6,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 
 async function api(path, opts = {}) {
   const method = opts.method || 'GET';
-  const headers = {};
+  const headers = { 'X-Requested-With': 'stromrechner' };
   if (opts.body) headers['Content-Type'] = 'application/json';
   const r = await fetch('/api' + path, { method, headers, body: opts.body ? JSON.stringify(opts.body) : undefined, credentials: 'same-origin' });
   const j = await r.json().catch(() => ({}));
