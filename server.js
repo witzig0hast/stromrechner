@@ -456,6 +456,37 @@ function sameOrigin(req) {
   return req.headers['x-requested-with'] === 'stromrechner';
 }
 
+/* ---------- Live-Werte ---------- */
+const UNIT_FACTOR = { power: { w: 1, kw: 1000, mw: 0.001 }, voltage: { v: 1, kv: 1000, mv: 0.001 }, current: { a: 1, ma: 0.001, ka: 1000 } };
+const KEYS = { power: 'entityPower', voltage: 'entityVoltage', current: 'entityCurrent' };
+let liveCache = { t: 0, v: null }, sparkCache = { t: 0, v: [] }, liveBusy = null;
+
+async function readLive() {
+  const s = db.settings;
+  if (!s.haUrl || !s.haToken || !s.entityPower) throw new HttpError(400, 'Home Assistant ist noch nicht konfiguriert.');
+  const out = {};
+  await Promise.all(Object.entries(KEYS).map(async ([k, field]) => {
+    const id = s[field];
+    if (!id) return;
+    try {
+      const st = await haFetch(s.haUrl, s.haToken, `/api/states/${encodeURIComponent(id)}`, 6000);
+      const raw = parseFloat(st.state);
+      const unit = String(st.attributes?.unit_of_measurement || '').toLowerCase();
+      const f = UNIT_FACTOR[k][unit] ?? 1; // Einheit auf W / V / A normieren
+      out[k] = { value: Number.isFinite(raw) ? raw * f : null, state: String(st.state).slice(0, 20), updated: Date.parse(st.last_updated) || null };
+    } catch (e) { out[k] = { value: null, error: e.message }; }
+  }));
+  const price = Number(s.pricePerKwh) || 0;
+  const w = out.power?.value;
+  // Kurzer Verlauf (letzte 30 Min.) für das Mini-Diagramm, höchstens alle 20 s neu holen
+  if (Date.now() - sparkCache.t > 20000) {
+    sparkCache.t = Date.now();
+    const end = Date.now(), start = end - 30 * 60000;
+    sparkCache.v = await fetchHistory(s, s.entityPower, start - 60000, end).then((p) => p.filter((x) => x.v !== null && x.t >= start - 60000).map((x) => ({ t: Math.max(x.t, start), v: x.v }))).catch(() => sparkCache.v);
+  }
+  return { at: Date.now(), ...out, costPerHour: w != null ? (w / 1000) * price : null, price, spark: sparkCache.v };
+}
+
 let calcCache = new Map(), calcRunning = 0;
 
 async function api(req, res, url, ip) {
@@ -569,6 +600,19 @@ async function api(req, res, url, ip) {
     const b = await readBody(req);
     try { return json(req, res, 200, await runAlertCheck({ send: b.send === true, force: true })); }
     catch (e) { return json(req, res, 400, { error: e.message }); }
+  }
+
+  if (p === '/api/live' && m === 'GET') {
+    if (Date.now() - liveCache.t < 2000 && liveCache.v) return json(req, res, 200, liveCache.v);
+    try {
+      liveBusy = liveBusy || readLive().finally(() => { liveBusy = null; });
+      const v = await liveBusy;
+      liveCache = { t: Date.now(), v };
+      return json(req, res, 200, v);
+    } catch (e) {
+      if (e instanceof HttpError) throw e;
+      return json(req, res, 502, { error: e.cause?.code ? `${e.message} (${e.cause.code})` : e.message });
+    }
   }
 
   if (p === '/api/calc' && m === 'GET') {

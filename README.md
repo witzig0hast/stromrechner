@@ -29,9 +29,11 @@ Bei Überschreitung der Schwellen (Prozent und Mindest-Mehrverbrauch) geht eine 
 (Grundlast, Laufzeit, Spitzenleistung, Zeitfenster) ist regelbasiert, ohne KI.
 
 ## Dashboard
+Ganz oben zeigt ein **Live-Bereich** Leistung (W), Spannung (V), Stromstärke (A) und die aktuellen Kosten pro Stunde,
+alle 5 Sekunden aktualisiert, mit Verlauf der letzten 30 Minuten (Einheiten wie kW oder mA werden umgerechnet).
 Die Auswertung lädt sofort beim Öffnen und zeigt standardmäßig **Gesamt** (alle Daten ab der ersten Messung,
-mit Monatsdiagramm und Monatsübersicht). Zeitraum per Schnellwahl (Gesamt, Heute, 7 Tage, 30 Tage, Dieser Monat,
-Dieses Jahr) oder „Eigener Zeitraum“; läuft der Zeitraum bis „jetzt“, aktualisiert sich die Seite jede Minute.
+mit Monatsdiagramm und Monatsübersicht). Zeitraum per Schnellwahl (Gesamt, Heute, Gestern, 7 Tage, 30 Tage, Dieser Monat,
+Letzter Monat, Dieses Jahr) oder „Eigener Zeitraum“; läuft der Zeitraum bis „jetzt“, aktualisiert sich die Seite jede Minute.
 
 ## Sicherheit und Verschlüsselung
 - **Geheimnisse verschlüsselt:** HA-Token und SMTP-Passwort liegen in `/data/db.json` mit AES-256-GCM verschlüsselt.

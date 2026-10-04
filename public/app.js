@@ -28,12 +28,14 @@ const fmtDT = (iso) => new Date(iso).toLocaleString('de-DE', { dateStyle: 'mediu
 let refreshTimer = null;
 const p2 = (n) => String(n).padStart(2, '0');
 const dtLocal = (d) => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}T${p2(d.getHours())}:${p2(d.getMinutes())}`;
-const PRESETS = [['all', 'Gesamt'], ['today', 'Heute'], ['7d', '7 Tage'], ['30d', '30 Tage'], ['month', 'Dieser Monat'], ['year', 'Dieses Jahr'], ['custom', 'Eigener Zeitraum']];
+const PRESETS = [['all', 'Gesamt'], ['today', 'Heute'], ['yesterday', 'Gestern'], ['7d', '7 Tage'], ['30d', '30 Tage'], ['month', 'Dieser Monat'], ['lastmonth', 'Letzter Monat'], ['year', 'Dieses Jahr'], ['custom', 'Eigener Zeitraum']];
 function presetRange(id, custom) {
   const n = new Date(), d0 = new Date(n.getFullYear(), n.getMonth(), n.getDate());
   const off = (days) => dtLocal(new Date(d0.getFullYear(), d0.getMonth(), d0.getDate() - days));
   if (id === 'all') return { start: 'all', end: '' };
   if (id === 'today') return { start: dtLocal(d0), end: '' };
+  if (id === 'yesterday') return { start: off(1), end: dtLocal(d0) };
+  if (id === 'lastmonth') return { start: dtLocal(new Date(n.getFullYear(), n.getMonth() - 1, 1)), end: dtLocal(new Date(n.getFullYear(), n.getMonth(), 1)) };
   if (id === '7d') return { start: off(6), end: '' };
   if (id === '30d') return { start: off(29), end: '' };
   if (id === 'month') return { start: dtLocal(new Date(n.getFullYear(), n.getMonth(), 1)), end: '' };
@@ -51,6 +53,13 @@ async function dashboard() {
   app.innerHTML = `
     <div class="head"><h1>Auswertung</h1>
     <p class="sub">Verbrauch und Kosten deiner Steckdose aus Home Assistant.</p></div>
+    <section class="card live" id="live" ${configured ? '' : 'hidden'}>
+      <div class="card-h"><div><h2>Live</h2><p id="liveInfo">Verbinde …</p></div><span class="tag live" id="liveTag">LIVE</span></div>
+      <div class="card-b">
+        <div class="grid g4" id="liveGrid"></div>
+        <div id="liveSpark" class="spark"></div>
+      </div>
+    </section>
     <section class="card"><div class="card-b bar-row">
       <div class="chips" role="tablist" aria-label="Zeitraum">${PRESETS.map(([id, l]) => `<button class="chip${id === preset ? ' on' : ''}" data-p="${id}" role="tab">${l}</button>`).join('')}</div>
       <div class="cmp"><label for="ref">Vergleich mit Gesamtverbrauch</label>
@@ -113,7 +122,48 @@ async function dashboard() {
   };
   clearInterval(refreshTimer);
   refreshTimer = setInterval(() => { if (!document.hidden && !presetRange(preset, { start: $('#start').value, end: $('#end').value }).end) run(true); }, 60000);
+  startLive(configured, cur);
   await run();
+}
+
+/* ---------------- Live ---------------- */
+let liveTimer = null;
+function sparkline(pts) {
+  if (!pts || pts.length < 2) return '<div class="hint">Noch kein Verlauf der letzten 30 Minuten.</div>';
+  const W = 1000, H = 90, pad = 4, now = Date.now(), t0 = now - 30 * 60000;
+  const vmax = Math.max(...pts.map((p) => p.v), 1), vmin = 0;
+  const X = (t) => pad + ((t - t0) / (now - t0)) * (W - 2 * pad), Y = (v) => H - pad - ((v - vmin) / (vmax - vmin)) * (H - 2 * pad);
+  let d = '';
+  pts.forEach((p, i) => { d += `${i ? 'L' : 'M'}${X(p.t).toFixed(1)} ${Y(p.v).toFixed(1)} `; if (i === pts.length - 1) d += `L${X(now).toFixed(1)} ${Y(p.v).toFixed(1)}`; });
+  return `<svg class="chart sm" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><path class="area" d="${d} L${X(now).toFixed(1)} ${H - pad} L${X(pts[0].t).toFixed(1)} ${H - pad} Z"/><path class="line" d="${d}"/></svg>
+    <div class="spark-lbl"><span>vor 30 Min.</span><span>Spitze ${nf(vmax, 0)} W</span><span>jetzt</span></div>`;
+}
+function startLive(configured, cur) {
+  clearInterval(liveTimer);
+  if (!configured) return;
+  let failed = 0;
+  const tile = (cls, icon, label, v, unit, d) => `<div class="kpi ${cls}"><small>${ico(icon)}${label}</small><div class="v">${v === null || v === undefined ? '–' : nf(v, d)}<em>${unit}</em></div></div>`;
+  const tick = async () => {
+    if (document.hidden || !$('#liveGrid')) return;
+    try {
+      const r = await api('/live');
+      failed = 0;
+      $('#liveGrid').innerHTML =
+        tile('hero', 'bolt', 'Leistung', r.power?.value, 'W', 1) +
+        (r.voltage ? tile('cy', 'volt', 'Spannung', r.voltage.value, 'V', 1) : '') +
+        (r.current ? tile('cy', 'amp', 'Stromstärke', r.current.value, 'A', 3) : '') +
+        (r.costPerHour != null ? tile('', 'euro', 'Kosten pro Stunde', r.costPerHour, `${cur}/h`, 3) : '');
+      $('#liveSpark').innerHTML = sparkline(r.spark);
+      $('#liveInfo').textContent = `Aktualisiert um ${new Date(r.at).toLocaleTimeString('de-DE')} · alle 5 Sekunden`;
+      $('#liveTag').classList.remove('off'); $('#liveTag').textContent = 'LIVE';
+    } catch (e) {
+      failed++;
+      if ($('#liveTag')) { $('#liveTag').classList.add('off'); $('#liveTag').textContent = 'OFFLINE'; }
+      if ($('#liveInfo')) $('#liveInfo').textContent = failed > 1 ? `Keine Verbindung: ${e.message}` : 'Verbinde …';
+    }
+  };
+  tick();
+  liveTimer = setInterval(tick, 5000);
 }
 
 const ICON = {
@@ -315,7 +365,7 @@ async function settings() {
 
 /* ---------------- Router ---------------- */
 async function route() {
-  clearInterval(refreshTimer);
+  clearInterval(refreshTimer); clearInterval(liveTimer);
   const page = location.hash.startsWith('#/settings') ? 'settings' : 'dash';
   document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('on', a.dataset.nav === page));
   try { await (page === 'settings' ? settings() : dashboard()); }

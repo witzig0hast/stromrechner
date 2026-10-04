@@ -109,3 +109,15 @@ input[type=checkbox]{width:17px;height:17px;accent-color:var(--accent);flex:none
 #out.loading{opacity:.5;transition:opacity .2s}
 .tbl.tall{max-height:360px}.tbl.mid{max-height:280px;margin-top:18px}.tbl.top{margin-top:18px}
 .msg ul{padding-left:20px}
+
+.card.live{border-color:#2a3a52}
+.tag.live.off::before{background:var(--red);box-shadow:0 0 0 3px rgba(255,118,118,.2)}
+.tag.live.off{color:var(--red)}
+.tag.live::before{animation:pulse 1.6s infinite}
+.tag.live.off::before{animation:none}
+@keyframes pulse{50%{opacity:.35}}
+.spark{margin-top:16px}
+.spark .area{fill:rgba(76,201,232,.14);stroke:none}
+.spark .line{fill:none;stroke:var(--cyan);stroke-width:2;vector-effect:non-scaling-stroke}
+.spark-lbl{display:flex;justify-content:space-between;font-size:11.5px;color:var(--faint);margin-top:4px}
+.chart.sm{height:90px}
