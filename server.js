@@ -459,7 +459,7 @@ function sameOrigin(req) {
 /* ---------- Live-Werte ---------- */
 const UNIT_FACTOR = { power: { w: 1, kw: 1000, mw: 0.001 }, voltage: { v: 1, kv: 1000, mv: 0.001 }, current: { a: 1, ma: 0.001, ka: 1000 } };
 const KEYS = { power: 'entityPower', voltage: 'entityVoltage', current: 'entityCurrent' };
-let liveCache = { t: 0, v: null }, sparkCache = { t: 0, v: [] }, liveBusy = null;
+let liveCache = { t: 0, v: null }, sparkCache = { t: 0, v: { power: null, voltage: null, current: null } }, liveBusy = null;
 
 async function readLive() {
   const s = db.settings;
@@ -473,17 +473,21 @@ async function readLive() {
       const raw = parseFloat(st.state);
       const unit = String(st.attributes?.unit_of_measurement || '').toLowerCase();
       const f = UNIT_FACTOR[k][unit] ?? 1; // Einheit auf W / V / A normieren
-      out[k] = { value: Number.isFinite(raw) ? raw * f : null, state: String(st.state).slice(0, 20), updated: Date.parse(st.last_updated) || null };
+      out[k] = { factor: f, value: Number.isFinite(raw) ? raw * f : null, state: String(st.state).slice(0, 20), updated: Date.parse(st.last_updated) || null };
     } catch (e) { out[k] = { value: null, error: e.message }; }
   }));
   const price = Number(s.pricePerKwh) || 0;
   const w = out.power?.value;
-  // Kurzer Verlauf (letzte 30 Min.) für das Mini-Diagramm, höchstens alle 20 s neu holen
+  // Verlauf der letzten 30 Min. (Leistung, Spannung, Stromstärke) für das Diagramm samt Hover, höchstens alle 20 s neu holen
   if (Date.now() - sparkCache.t > 20000) {
     sparkCache.t = Date.now();
     const end = Date.now(), start = end - 30 * 60000;
-    sparkCache.v = await fetchHistory(s, s.entityPower, start - 60000, end).then((p) => p.filter((x) => x.v !== null && x.t >= start - 60000).map((x) => ({ t: Math.max(x.t, start), v: x.v }))).catch(() => sparkCache.v);
+    const one = (k) => !s[KEYS[k]] ? Promise.resolve(null)
+      : fetchHistory(s, s[KEYS[k]], start - 60000, end).then((p) => p.filter((x) => x.v !== null).map((x) => ({ t: Math.max(x.t, start), v: x.v * (out[k]?.factor ?? 1) }))).catch(() => (sparkCache.v && sparkCache.v[k]) || null);
+    const [power, voltage, current] = await Promise.all([one('power'), one('voltage'), one('current')]);
+    sparkCache.v = { power, voltage, current };
   }
+  for (const k of Object.keys(out)) delete out[k].factor;
   return { at: Date.now(), ...out, costPerHour: w != null ? (w / 1000) * price : null, price, spark: sparkCache.v };
 }
 

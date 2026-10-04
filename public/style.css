@@ -117,6 +117,15 @@ input[type=checkbox]{width:17px;height:17px;accent-color:var(--accent);flex:none
 .tag.live.off::before{animation:none}
 @keyframes pulse{50%{opacity:.35}}
 .spark{margin-top:16px}
+.spark-wrap{position:relative;touch-action:pan-y;cursor:crosshair}
+[hidden]{display:none!important}
+.xh{position:absolute;top:0;bottom:0;width:1px;background:var(--accent);opacity:.8;pointer-events:none}
+.dot{position:absolute;width:10px;height:10px;margin:-5px 0 0 -5px;border-radius:50%;background:var(--accent);border:2px solid var(--bg);pointer-events:none}
+.tip{position:absolute;top:-6px;transform:translate(-50%,-100%);background:var(--surface2);border:1px solid var(--line2);border-radius:8px;padding:8px 11px;font-size:12.5px;pointer-events:none;white-space:nowrap;z-index:3;box-shadow:0 8px 24px rgba(0,0,0,.45);min-width:150px}
+.tip.left{transform:translate(-100%,-100%)}.tip.right{transform:translate(0,-100%)}
+.tip .tt{font-weight:700;color:var(--accent);margin-bottom:4px;font-variant-numeric:tabular-nums}
+.tip div:not(.tt){display:flex;justify-content:space-between;gap:16px;color:var(--muted)}
+.tip b{color:var(--text);font-variant-numeric:tabular-nums}
 .spark .area{fill:rgba(76,201,232,.14);stroke:none}
 .spark .line{fill:none;stroke:var(--cyan);stroke-width:2;vector-effect:non-scaling-stroke}
 .spark-lbl{display:flex;justify-content:space-between;font-size:11.5px;color:var(--faint);margin-top:4px}

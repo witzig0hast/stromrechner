@@ -128,20 +128,49 @@ async function dashboard() {
 
 /* ---------------- Live ---------------- */
 let liveTimer = null;
-function sparkline(pts) {
+const SPARK = { W: 1000, H: 90, pad: 4 };
+function sparkline(r) {
+  const pts = r.spark && r.spark.power;
   if (!pts || pts.length < 2) return '<div class="hint">Noch kein Verlauf der letzten 30 Minuten.</div>';
-  const W = 1000, H = 90, pad = 4, now = Date.now(), t0 = now - 30 * 60000;
-  const vmax = Math.max(...pts.map((p) => p.v), 1), vmin = 0;
-  const X = (t) => pad + ((t - t0) / (now - t0)) * (W - 2 * pad), Y = (v) => H - pad - ((v - vmin) / (vmax - vmin)) * (H - 2 * pad);
+  const { W, H, pad } = SPARK, now = r.at, t0 = now - 30 * 60000;
+  const vmax = Math.max(...pts.map((p) => p.v), 1);
+  const X = (t) => pad + ((t - t0) / (now - t0)) * (W - 2 * pad), Y = (v) => H - pad - (v / vmax) * (H - 2 * pad);
   let d = '';
   pts.forEach((p, i) => { d += `${i ? 'L' : 'M'}${X(p.t).toFixed(1)} ${Y(p.v).toFixed(1)} `; if (i === pts.length - 1) d += `L${X(now).toFixed(1)} ${Y(p.v).toFixed(1)}`; });
-  return `<svg class="chart sm" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><path class="area" d="${d} L${X(now).toFixed(1)} ${H - pad} L${X(pts[0].t).toFixed(1)} ${H - pad} Z"/><path class="line" d="${d}"/></svg>
-    <div class="spark-lbl"><span>vor 30 Min.</span><span>Spitze ${nf(vmax, 0)} W</span><span>jetzt</span></div>`;
+  return `<div class="spark-wrap"><svg class="chart sm" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><path class="area" d="${d} L${X(now).toFixed(1)} ${H - pad} L${X(pts[0].t).toFixed(1)} ${H - pad} Z"/><path class="line" d="${d}"/></svg><div class="xh" hidden></div><div class="dot" hidden></div><div class="tip" hidden></div></div>
+    <div class="spark-lbl"><span>vor 30 Min.</span><span>Spitze ${nf(vmax, 0)} W · Maus darüber für Details</span><span>jetzt</span></div>`;
+}
+/* Hover: Wert zum Zeitpunkt (Stufenverlauf: zuletzt bekannter Wert) */
+let liveData = null, hoverX = null, liveCur = '€';
+const valueAt = (arr, t) => { if (!arr || !arr.length) return null; let v = null; for (const p of arr) { if (p.t <= t) v = p.v; else break; } return v; };
+function showHover() {
+  const wrap = $('#liveSpark .spark-wrap');
+  if (!wrap) return;
+  const xh = $('.xh', wrap), dot = $('.dot', wrap), tip = $('.tip', wrap);
+  if (hoverX === null || !liveData) { xh.hidden = dot.hidden = tip.hidden = true; return; }
+  const { W, H, pad } = SPARK, r = liveData, now = r.at, t0 = now - 30 * 60000;
+  const x = Math.min(Math.max(hoverX * W, pad), W - pad);
+  const t = t0 + ((x - pad) / (W - 2 * pad)) * (now - t0);
+  const w = valueAt(r.spark.power, t), v = valueAt(r.spark.voltage, t), a = valueAt(r.spark.current, t);
+  const vmax = Math.max(...r.spark.power.map((p) => p.v), 1);
+  const pct = (x / W) * 100;
+  xh.style.left = pct + '%'; xh.hidden = false;
+  if (w !== null) { dot.style.left = pct + '%'; dot.style.top = ((H - pad - (w / vmax) * (H - 2 * pad)) / H) * 100 + '%'; dot.hidden = false; } else dot.hidden = true;
+  const row = (l, val, u, dd) => (val === null ? '' : `<div><span>${l}</span><b>${nf(val, dd)} ${u}</b></div>`);
+  tip.innerHTML = `<div class="tt">${new Date(t).toLocaleTimeString('de-DE')}</div>${row('Leistung', w, 'W', 1)}${row('Spannung', v, 'V', 1)}${row('Stromstärke', a, 'A', 3)}${w !== null ? row('Kosten', (w / 1000) * r.price, liveCur + '/h', 3) : ''}`;
+  tip.hidden = false;
+  tip.classList.toggle('left', pct > 70); tip.classList.toggle('right', pct < 30);
+  tip.style.left = pct + '%';
 }
 function startLive(configured, cur) {
   clearInterval(liveTimer);
   if (!configured) return;
   let failed = 0;
+  hoverX = null; liveData = null;
+  const box = $('#liveSpark');
+  const move = (ev) => { const rc = $('.spark-wrap', box)?.getBoundingClientRect(); if (!rc || !rc.width) return; hoverX = Math.min(1, Math.max(0, (ev.clientX - rc.left) / rc.width)); showHover(); };
+  box.onpointermove = move; box.onpointerdown = move;
+  box.onpointerleave = () => { hoverX = null; showHover(); };
   const tile = (cls, icon, label, v, unit, d) => `<div class="kpi ${cls}"><small>${ico(icon)}${label}</small><div class="v">${v === null || v === undefined ? '–' : nf(v, d)}<em>${unit}</em></div></div>`;
   const tick = async () => {
     if (document.hidden || !$('#liveGrid')) return;
@@ -153,7 +182,9 @@ function startLive(configured, cur) {
         (r.voltage ? tile('cy', 'volt', 'Spannung', r.voltage.value, 'V', 1) : '') +
         (r.current ? tile('cy', 'amp', 'Stromstärke', r.current.value, 'A', 3) : '') +
         (r.costPerHour != null ? tile('', 'euro', 'Kosten pro Stunde', r.costPerHour, `${cur}/h`, 3) : '');
-      $('#liveSpark').innerHTML = sparkline(r.spark);
+      liveData = r; liveCur = cur;
+      $('#liveSpark').innerHTML = sparkline(r);
+      showHover();
       $('#liveInfo').textContent = `Aktualisiert um ${new Date(r.at).toLocaleTimeString('de-DE')} · alle 5 Sekunden`;
       $('#liveTag').classList.remove('off'); $('#liveTag').textContent = 'LIVE';
     } catch (e) {
