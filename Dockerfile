@@ -5,7 +5,7 @@ ENV NODE_ENV=production \
     DATA_DIR=/data
 RUN apk add --no-cache tzdata && mkdir -p /data && chown node:node /data
 WORKDIR /app
-COPY --chown=node:node package.json server.js lib.js smtp.js alerts.js auth.js ./
+COPY --chown=node:node package.json server.js lib.js smtp.js alerts.js ./
 COPY --chown=node:node public ./public
 USER node
 VOLUME /data

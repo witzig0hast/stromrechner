@@ -9,8 +9,7 @@ für einen frei wählbaren Zeitraum berechnet und mit dem Gesamtverbrauch vergle
 docker compose up -d --build
 ```
 
-Dann `http://localhost:8723` öffnen. Beim ersten Start steht ein **Einrichtungscode** im Log
-(`docker compose logs stromrechner`); damit legst du im Browser das Passwort fest (oder du setzt `ADMIN_PASSWORD`). Daten liegen im Volume `/data` (`db.json`).
+Dann `http://localhost:8723` öffnen. Daten liegen im Volume `/data` (`db.json`).
 Zeitzone per `TZ` in `docker-compose.yml` anpassen.
 
 ## Einrichtung
@@ -33,18 +32,16 @@ Bei Überschreitung der Schwellen (Prozent und Mindest-Mehrverbrauch) geht eine 
 Die Auswertung lädt sofort beim Öffnen. Zeitraum per Schnellwahl (Heute, 7 Tage, 30 Tage, Dieser Monat,
 Dieses Jahr) oder „Eigener Zeitraum“; läuft der Zeitraum bis „jetzt“, aktualisiert sich die Seite jede Minute.
 
-## Sicherheit
-- Pflicht-Login (scrypt-Passwort-Hash, Sitzungs-Cookie `HttpOnly` + `SameSite=Strict`, `Secure` unter HTTPS),
-  Sperre nach 5 Fehlversuchen (15 Min.), Erst-Einrichtung nur mit Code aus dem Log
-- CSRF-Token + Origin-Prüfung bei allen schreibenden Anfragen
-- Strenge CSP (kein Inline-Script/-Style), `X-Frame-Options`, `nosniff`, `Referrer-Policy: no-referrer`
-- Geheimnisse (HA-Token, SMTP-Passwort) werden nie an den Browser gesendet; bei geänderter URL/Server müssen sie
-  neu eingegeben werden, damit sie nicht an fremde Hosts gehen
-- Eingabevalidierung (URL, Entitäten, Datum, E-Mail), Größen- und Zeitraumlimits, Rate-Limit
-- Container: Non-Root, read-only Dateisystem, alle Capabilities entfernt, `no-new-privileges`, Ressourcenlimits
-- Daten liegen in `/data/db.json` (Rechte 0600) – das Volume wie ein Geheimnis behandeln (Backups!).
-
-Für Zugriff über das Internet: HTTPS-Reverse-Proxy (z. B. Caddy/Traefik/nginx) davorsetzen. Proxys werden automatisch erkannt
-(`X-Forwarded-For/-Proto/-Host` werden akzeptiert, wenn die Verbindung von einer privaten/lokalen Adresse kommt;
-`TRUST_PROXY=1` erzwingt es, `0` schaltet es ab). Der Proxy sollte `X-Forwarded-Proto` setzen, damit der Cookie `Secure` wird.
-Ohne HTTPS wird das Passwort im Klartext übertragen – nur im vertrauenswürdigen Heimnetz betreiben.
+## Sicherheit und Verschlüsselung
+- **Geheimnisse verschlüsselt:** HA-Token und SMTP-Passwort liegen in `/data/db.json` mit AES-256-GCM verschlüsselt.
+  Schlüssel: `SECRET_KEY` (empfohlen) oder die automatisch erzeugte `/data/secret.key`. Ältere Klartext-Daten werden beim Start
+  automatisch verschlüsselt. Passt der Schlüssel nicht, bricht die App ab, ohne etwas zu überschreiben.
+- **Transport:** SMTP nur mit direktem TLS (Port 465). Für die Weboberfläche entweder HTTPS-Reverse-Proxy davorsetzen
+  (wird automatisch erkannt: `X-Forwarded-*` gilt, wenn die Verbindung von einer privaten/lokalen Adresse kommt;
+  `TRUST_PROXY=1|0` erzwingt/verbietet es) oder direktes HTTPS mit `TLS_CERT`/`TLS_KEY`.
+- **Kein Login:** Die Oberfläche ist ohne Anmeldung erreichbar – betreibe sie nur im vertrauenswürdigen Netz oder hinter einem
+  Proxy mit eigener Authentifizierung. Optional `ALLOWED_HOSTS` gegen DNS-Rebinding.
+- Geheimnisse werden nie an den Browser gesendet; bei geänderter URL/Server müssen sie neu eingegeben werden.
+- Schreibende Anfragen: JSON-Pflicht + Origin-Prüfung (CSRF). Strenge CSP, `X-Frame-Options`, `nosniff`.
+- Eingabevalidierung (URL, Entitäten, Datum, E-Mail), Größen-/Zeitraumlimits, Rate-Limit.
+- Container: Non-Root, read-only Dateisystem, keine Capabilities, `no-new-privileges`, Ressourcenlimits.

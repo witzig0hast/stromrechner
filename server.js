@@ -3,7 +3,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const auth = require('./auth');
+const https = require('node:https');
 const { sendMail, parseAddrs, EMAIL_RE } = require('./smtp');
 const { runChecks, buildAlertMail, buildTestMail, neededStart } = require('./alerts');
 const { DAY, nextDay, dayStart, dayKey, integrate, parseHistory, normalizeUrl } = require('./lib');
@@ -44,21 +44,62 @@ const DEFAULTS = {
 };
 
 fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+
+/* ---------- Verschlüsselung der Geheimnisse (AES-256-GCM) ---------- */
+// Schlüssel: SECRET_KEY (empfohlen, liegt dann nicht im Volume) oder automatisch erzeugte Datei /data/secret.key
+function loadKey() {
+  if (process.env.SECRET_KEY) return crypto.scryptSync(process.env.SECRET_KEY, 'stromrechner-v1', 32);
+  const f = path.join(DATA_DIR, 'secret.key');
+  try {
+    const k = Buffer.from(fs.readFileSync(f, 'utf8').trim(), 'base64');
+    if (k.length === 32) return k;
+  } catch { /* neu erzeugen */ }
+  const k = crypto.randomBytes(32);
+  fs.writeFileSync(f, k.toString('base64'), { mode: 0o600 });
+  return k;
+}
+const KEY = loadKey();
+const SECRET_FIELDS = ['haToken', 'smtpPass'];
+const PREFIX = 'enc:v1:';
+function encrypt(text) {
+  if (!text) return '';
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', KEY, iv);
+  const ct = Buffer.concat([c.update(text, 'utf8'), c.final()]);
+  return PREFIX + [iv, c.getAuthTag(), ct].map((x) => x.toString('base64')).join(':');
+}
+function decrypt(v) {
+  if (!v || !String(v).startsWith(PREFIX)) return v || ''; // Klartext aus älteren Versionen
+  const [iv, tag, ct] = v.slice(PREFIX.length).split(':').map((x) => Buffer.from(x, 'base64'));
+  const d = crypto.createDecipheriv('aes-256-gcm', KEY, iv);
+  d.setAuthTag(tag);
+  return Buffer.concat([d.update(ct), d.final()]).toString('utf8');
+}
+
 let db = structuredClone(DEFAULTS);
+let needsMigration = false;
 try {
   const saved = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  db = { settings: { ...DEFAULTS.settings, ...saved.settings }, history: saved.history || [], alerts: saved.alerts || [], alertState: saved.alertState || {}, auth: saved.auth || null, sessions: saved.sessions || {} };
-} catch { /* first start */ }
+  db = { settings: { ...DEFAULTS.settings, ...saved.settings }, history: saved.history || [], alerts: saved.alerts || [], alertState: saved.alertState || {} };
+  for (const f of SECRET_FIELDS) {
+    const raw = db.settings[f];
+    if (raw && !String(raw).startsWith(PREFIX)) needsMigration = true;
+    try { db.settings[f] = decrypt(raw); } catch {
+      console.error(`Entschlüsselung von "${f}" fehlgeschlagen: Passt SECRET_KEY bzw. secret.key zu dieser db.json? Abbruch, damit nichts überschrieben wird.`);
+      process.exit(1);
+    }
+  }
+  if (saved.auth || saved.sessions) needsMigration = true; // Altlasten der früheren Login-Version entfernen
+} catch (e) { if (e.code !== 'ENOENT') { console.error('db.json nicht lesbar:', e.message); process.exit(1); } }
 
-auth.loadSessions(db.sessions, () => saveSoon());
-let saveTimer = null;
-const saveSoon = () => { clearTimeout(saveTimer); saveTimer = setTimeout(save, 1000); };
 function save() {
+  const out = structuredClone(db);
+  for (const f of SECRET_FIELDS) out.settings[f] = encrypt(db.settings[f]);
   const tmp = DB_FILE + '.tmp';
-  db.sessions = auth.dumpSessions();
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2), { mode: 0o600 });
+  fs.writeFileSync(tmp, JSON.stringify(out, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, DB_FILE);
 }
+if (needsMigration) save();
 
 /* ---------- Home Assistant ---------- */
 
@@ -329,10 +370,6 @@ const SEC_HEADERS = {
 };
 const isHttps = (req) => !!req.socket.encrypted || (trusted(req) && fwd(req, 'x-forwarded-proto')[0] === 'https');
 const clientIp = (req) => (trusted(req) ? fwd(req, 'x-forwarded-for').pop() : null) || peerIp(req);
-/* Sperre zählt pro Client-IP (5 Versuche) und zusätzlich pro Proxy-Verbindung (30), damit gefälschte Header nicht helfen */
-const lockWait = (req) => Math.max(auth.lockedFor(clientIp(req)), auth.lockedFor('peer:' + peerIp(req)));
-const lockFail = (req) => { auth.recordFail(clientIp(req)); auth.recordFail('peer:' + peerIp(req), 30); };
-const lockClear = (req) => auth.clearFails(clientIp(req));
 
 function send(req, res, code, body, headers = {}) {
   const h = { ...SEC_HEADERS, ...headers };
@@ -343,6 +380,15 @@ function send(req, res, code, body, headers = {}) {
 function json(req, res, code, body, headers = {}) {
   send(req, res, code, JSON.stringify(body), { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
 }
+const hits = new Map();
+function rateLimit(ip, limit = 600) { // Anfragen pro Minute und Client
+  const now = Date.now();
+  let h = hits.get(ip);
+  if (!h || h.reset < now) { h = { n: 0, reset: now + 60e3 }; hits.set(ip, h); }
+  return ++h.n <= limit;
+}
+setInterval(() => { const now = Date.now(); for (const [k, h] of hits) if (h.reset < now) hits.delete(k); }, 300e3).unref();
+
 class HttpError extends Error { constructor(code, msg) { super(msg); this.code = code; } }
 
 function readBody(req) {
@@ -380,28 +426,6 @@ function cleanEntity(v) {
   return t;
 }
 
-/* Sitzungs-/Auth-Zustand */
-const ENV_PASSWORD = process.env.ADMIN_PASSWORD || '';
-let authRecord = db.auth || null;
-let setupCode = null;
-(async () => {
-  if (ENV_PASSWORD) {
-    if (ENV_PASSWORD.length < auth.MIN_PW) { console.error(`ADMIN_PASSWORD ist zu kurz (mind. ${auth.MIN_PW} Zeichen).`); process.exit(1); }
-    authRecord = await auth.hashPassword(ENV_PASSWORD);
-  } else if (!authRecord) {
-    setupCode = crypto.randomBytes(5).toString('hex');
-    console.log(`\n=== EINRICHTUNG ===\nNoch kein Passwort gesetzt. Einrichtungscode (nur in diesem Log sichtbar): ${setupCode}\nÖffne die Web-Oberfläche und lege dort das Passwort fest.\n===================\n`);
-  }
-})();
-
-function sessionOf(req) {
-  const tok = auth.parseCookies(req.headers.cookie)[COOKIE];
-  const sess = auth.getSession(tok);
-  return { tok, sess };
-}
-function sessionCookie(req, token, maxAge) {
-  return `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${isHttps(req) ? '; Secure' : ''}`;
-}
 /** Origin-Prüfung gegen CSRF bei schreibenden Anfragen. */
 function sameOrigin(req) {
   const o = req.headers.origin;
@@ -413,43 +437,6 @@ function sameOrigin(req) {
   return allowed.includes(host);
 }
 
-async function authApi(req, res, p, m, ip) {
-  if (p === '/api/auth/state' && m === 'GET') {
-    const { sess } = sessionOf(req);
-    return json(req, res, 200, { setupRequired: !authRecord, authenticated: !!sess, csrf: sess ? sess.csrf : null, managedByEnv: !!ENV_PASSWORD });
-  }
-  if (p === '/api/auth/setup' && m === 'POST') {
-    if (authRecord) throw new HttpError(409, 'Passwort ist bereits gesetzt.');
-    const wait = lockWait(req);
-    if (wait) throw new HttpError(429, `Zu viele Versuche. Bitte ${wait} s warten.`);
-    const b = await readBody(req);
-    if (!setupCode || !auth.safeEq(str(b.code, 40), setupCode)) { lockFail(req); throw new HttpError(403, 'Einrichtungscode falsch (siehe Container-Log).'); }
-    const pw = typeof b.password === 'string' ? b.password : '';
-    if (pw.length < auth.MIN_PW || pw.length > 200) throw new HttpError(400, `Passwort muss mindestens ${auth.MIN_PW} Zeichen lang sein.`);
-    authRecord = await auth.hashPassword(pw);
-    db.auth = authRecord; setupCode = null; save();
-    lockClear(req);
-    const { token, sess } = auth.createSession();
-    return json(req, res, 200, { ok: true, csrf: sess.csrf }, { 'Set-Cookie': sessionCookie(req, token, 7 * 86400) });
-  }
-  if (p === '/api/auth/login' && m === 'POST') {
-    const wait = lockWait(req);
-    if (wait) throw new HttpError(429, `Zu viele Fehlversuche. Bitte ${Math.ceil(wait / 60)} Min. warten.`);
-    const b = await readBody(req);
-    const ok = authRecord && await auth.verifyPassword(typeof b.password === 'string' ? b.password.slice(0, 200) : '', authRecord);
-    if (!ok) { lockFail(req); throw new HttpError(401, 'Passwort falsch.'); }
-    lockClear(req);
-    const { token, sess } = auth.createSession();
-    return json(req, res, 200, { ok: true, csrf: sess.csrf }, { 'Set-Cookie': sessionCookie(req, token, 7 * 86400) });
-  }
-  if (p === '/api/auth/logout' && m === 'POST') {
-    const { tok, sess } = sessionOf(req);
-    if (sess && req.headers['x-csrf-token'] === sess.csrf) auth.destroySession(tok);
-    return json(req, res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, '', 0) });
-  }
-  return null;
-}
-
 let calcCache = new Map(), calcRunning = 0;
 
 async function api(req, res, url, ip) {
@@ -457,17 +444,6 @@ async function api(req, res, url, ip) {
 
   if (p === '/api/health') return json(req, res, 200, { ok: true });
   if (m !== 'GET' && m !== 'HEAD' && !sameOrigin(req)) throw new HttpError(403, 'Ungültige Herkunft');
-
-  if (p.startsWith('/api/auth/')) {
-    const r = await authApi(req, res, p, m, ip);
-    if (r !== null) return r;
-    throw new HttpError(404, 'Nicht gefunden');
-  }
-
-  // ab hier nur mit gültiger Sitzung
-  const { tok, sess } = sessionOf(req);
-  if (!sess) throw new HttpError(401, 'Nicht angemeldet');
-  if (m !== 'GET' && m !== 'HEAD' && !auth.safeEq(req.headers['x-csrf-token'] || '', sess.csrf)) throw new HttpError(403, 'CSRF-Token ungültig');
 
   if (p === '/api/settings' && m === 'GET') return json(req, res, 200, publicSettings());
   if (p === '/api/settings' && m === 'PUT') {
@@ -598,14 +574,16 @@ async function api(req, res, url, ip) {
   throw new HttpError(404, 'Nicht gefunden');
 }
 
-const server = http.createServer(async (req, res) => {
+const ALLOWED_HOSTS = (process.env.ALLOWED_HOSTS || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean);
+const handler = async (req, res) => {
   const ip = clientIp(req);
   try {
+    // optional: gegen DNS-Rebinding nur bekannte Hostnamen zulassen (ALLOWED_HOSTS=strom.example.com,192.168.1.5)
+    if (ALLOWED_HOSTS.length && !ALLOWED_HOSTS.includes(String(req.headers.host || '').toLowerCase().replace(/:\d+$/, ''))) throw new HttpError(421, 'Host nicht erlaubt');
     if (!['GET', 'HEAD', 'POST', 'PUT', 'DELETE'].includes(req.method)) throw new HttpError(405, 'Methode nicht erlaubt');
-    if (!auth.rateLimit(ip)) throw new HttpError(429, 'Zu viele Anfragen');
+    if (!rateLimit(ip)) throw new HttpError(429, 'Zu viele Anfragen');
     const url = new URL(req.url, 'http://x');
     if (url.pathname.startsWith('/api/')) {
-      if (url.pathname === '/api/auth/password' && req.method === 'POST') return await changePassword(req, res);
       return await api(req, res, url, ip);
     }
     const hit = STATIC[url.pathname];
@@ -618,29 +596,17 @@ const server = http.createServer(async (req, res) => {
     console.error('Fehler:', e.message);
     return json(req, res, 500, { error: 'Interner Fehler' });
   }
-});
+};
 
-async function changePassword(req, res) {
-  const { tok, sess } = sessionOf(req);
-  if (!sess) throw new HttpError(401, 'Nicht angemeldet');
-  if (!sameOrigin(req) || !auth.safeEq(req.headers['x-csrf-token'] || '', sess.csrf)) throw new HttpError(403, 'CSRF-Token ungültig');
-  if (ENV_PASSWORD) throw new HttpError(400, 'Das Passwort wird über ADMIN_PASSWORD verwaltet.');
-  const ip = clientIp(req);
-  const wait = lockWait(req);
-  if (wait) throw new HttpError(429, `Zu viele Fehlversuche. Bitte ${Math.ceil(wait / 60)} Min. warten.`);
-  const b = await readBody(req);
-  if (!(await auth.verifyPassword(typeof b.current === 'string' ? b.current.slice(0, 200) : '', authRecord))) { lockFail(req); throw new HttpError(403, 'Aktuelles Passwort falsch.'); }
-  const pw = typeof b.password === 'string' ? b.password : '';
-  if (pw.length < auth.MIN_PW || pw.length > 200) throw new HttpError(400, `Neues Passwort muss mindestens ${auth.MIN_PW} Zeichen lang sein.`);
-  authRecord = await auth.hashPassword(pw);
-  db.auth = authRecord; save();
-  auth.destroyAllExcept(tok);
-  return json(req, res, 200, { ok: true });
-}
+// Optional: direktes HTTPS, wenn TLS_CERT und TLS_KEY (Pfade zu PEM-Dateien) gesetzt sind
+const TLS = process.env.TLS_CERT && process.env.TLS_KEY
+  ? { cert: fs.readFileSync(process.env.TLS_CERT), key: fs.readFileSync(process.env.TLS_KEY), minVersion: 'TLSv1.2' }
+  : null;
+const server = TLS ? https.createServer(TLS, handler) : http.createServer(handler);
 
 server.headersTimeout = 15000;
 server.requestTimeout = 30000;
 server.keepAliveTimeout = 5000;
 server.maxRequestsPerSocket = 200;
 process.on('unhandledRejection', (e) => console.error('Unhandled:', e && e.message));
-server.listen(PORT, () => console.log(`Stromrechner läuft auf Port ${PORT} (TZ=${process.env.TZ || 'system'})`));
+server.listen(PORT, () => console.log(`Stromrechner läuft auf Port ${PORT} (${TLS ? 'HTTPS' : 'HTTP'}, TZ=${process.env.TZ || 'system'})`));

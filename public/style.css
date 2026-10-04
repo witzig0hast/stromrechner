@@ -92,13 +92,6 @@ input[type=checkbox]{width:17px;height:17px;accent-color:var(--accent);flex:none
 .sep{height:1px;background:var(--line);margin:20px 0}
 .msg ul{margin:6px 0 0}
 
-body.anon nav{display:none}
-.navbtn{background:transparent;border:1px solid transparent;color:var(--faint);font:inherit;font-weight:500;font-size:14px;padding:8px 12px;border-radius:8px;cursor:pointer}
-.navbtn:hover{color:var(--red);background:var(--surface)}
-.auth-wrap{display:grid;place-items:center;padding-top:6vh}
-.auth{width:100%;max-width:420px}
-.field{margin-bottom:16px}
-.btn.block{width:100%}
 .bar-row{display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap}
 .chips{display:flex;gap:6px;flex-wrap:wrap;flex:1 1 auto}
 .chip{background:var(--bg);color:var(--muted);border:1px solid var(--line2);border-radius:99px;padding:7px 12px;font:inherit;font-size:13.5px;font-weight:500;cursor:pointer;transition:.15s}

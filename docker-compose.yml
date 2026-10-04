@@ -7,9 +7,15 @@ services:
       - "8723:8723"            # hinter einem HTTPS-Reverse-Proxy z. B. "127.0.0.1:8723:8723"
     environment:
       TZ: Europe/Berlin
-      # Optional: Passwort fest vorgeben (min. 10 Zeichen). Ohne Angabe erscheint beim ersten Start
-      # ein Einrichtungscode im Container-Log (docker compose logs stromrechner).
-      # ADMIN_PASSWORD: "bitte-ein-langes-passwort"
+      # Schlüssel für die Verschlüsselung von HA-Token und SMTP-Passwort in /data/db.json (AES-256-GCM).
+      # Ohne Angabe wird beim ersten Start automatisch /data/secret.key erzeugt.
+      # Empfohlen: eigenen Schlüssel setzen, dann liegt er nicht im Volume (bei Verlust sind die Geheimnisse weg).
+      # SECRET_KEY: "ein-langer-zufaelliger-schluessel"
+      # Optional direktes HTTPS (PEM-Dateien im Container, z. B. per Volume eingebunden):
+      # TLS_CERT: /certs/fullchain.pem
+      # TLS_KEY: /certs/privkey.pem
+      # Optional gegen DNS-Rebinding: nur diese Hostnamen zulassen
+      # ALLOWED_HOSTS: "strom.example.com,192.168.1.5"
       # Reverse-Proxy (Caddy, nginx, Traefik …) wird automatisch erkannt: X-Forwarded-* wird akzeptiert,
       # wenn die Verbindung von einer privaten/lokalen Adresse kommt. Optional: "1" = immer, "0" = nie.
       # TRUST_PROXY: "auto"

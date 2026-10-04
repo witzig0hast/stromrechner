@@ -4,16 +4,12 @@ const app = $('#app');
 const nf = (n, d = 2) => Number(n).toLocaleString('de-DE', { minimumFractionDigits: d, maximumFractionDigits: d });
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-let csrf = null;
-class AuthError extends Error {}
 async function api(path, opts = {}) {
   const method = opts.method || 'GET';
   const headers = {};
   if (opts.body) headers['Content-Type'] = 'application/json';
-  if (method !== 'GET' && csrf) headers['X-CSRF-Token'] = csrf;
   const r = await fetch('/api' + path, { method, headers, body: opts.body ? JSON.stringify(opts.body) : undefined, credentials: 'same-origin' });
   const j = await r.json().catch(() => ({}));
-  if (r.status === 401 && !['/auth/login', '/auth/setup', '/auth/state'].includes(path)) { csrf = null; throw new AuthError('Sitzung abgelaufen'); }
   if (!r.ok) throw new Error(j.error || `Fehler ${r.status}`);
   return j;
 }
@@ -95,7 +91,6 @@ async function dashboard() {
       status(r.coverage < 0.98 ? `<div class="msg warn">Nur ${nf(r.coverage * 100, 0)} % des Zeitraums (${nf(r.coveredHours, 1)} von ${nf(r.hours, 1)} Std.) haben Messwerte. Durchschnitt, Kosten pro Tag und Hochrechnung beziehen sich auf die gemessene Zeit.</div>` : '');
       render(r, cur);
     } catch (e) {
-      if (e instanceof AuthError) throw e;
       if (my !== seq) return;
       status(`<div class="msg err">${esc(e.message)}</div>`); $('#out').innerHTML = '';
     } finally { $('#out').classList.remove('loading'); }
@@ -116,7 +111,7 @@ async function dashboard() {
     toast('Zeitraum gespeichert');
   };
   clearInterval(refreshTimer);
-  refreshTimer = setInterval(() => { if (!document.hidden && !presetRange(preset, { start: $('#start').value, end: $('#end').value }).end) run(true).catch(() => route()); }, 60000);
+  refreshTimer = setInterval(() => { if (!document.hidden && !presetRange(preset, { start: $('#start').value, end: $('#end').value }).end) run(true); }, 60000);
   await run();
 }
 
@@ -190,7 +185,7 @@ function chart(days) {
 
 /* ---------------- Einstellungen ---------------- */
 async function settings() {
-  const [s, hist, al, as] = await Promise.all([api('/settings'), api('/history'), api('/alerts'), api('/auth/state')]);
+  const [s, hist, al] = await Promise.all([api('/settings'), api('/history'), api('/alerts')]);
   app.innerHTML = `
     <div class="head"><h1>Einstellungen</h1>
     <p class="sub">Strompreis, Home-Assistant-Anbindung und frühere Verbrauchswerte verwalten.</p></div>
@@ -239,17 +234,6 @@ async function settings() {
       ${al.state.lastError ? `<div class="msg err">Letzter automatischer Versand fehlgeschlagen: ${esc(al.state.lastError)}</div>` : ''}
       <div id="mailStatus"></div>
       ${al.log.length ? `<div class="tbl mid"><table><thead><tr><th>Gesendet</th><th>Art</th><th>Zeitraum</th><th class="r">Abweichung</th></tr></thead><tbody>${al.log.map((a) => `<tr><td>${fmtDT(a.at)}</td><td>${a.kind === 'day' ? 'Tag' : 'Monat'}</td><td>${esc(a.label)}</td><td class="r">${a.deltaPct === null ? '–' : '+' + nf(a.deltaPct, 0) + ' %'}</td></tr>`).join('')}</tbody></table></div>` : ''}
-    </div></section>
-
-    <section class="card"><div class="card-h"><div><h2>Sicherheit</h2><p>Zugang zur Oberfläche.</p></div></div><div class="card-b">
-      ${as.managedByEnv ? '<div class="hint">Das Passwort wird über die Umgebungsvariable ADMIN_PASSWORD verwaltet.</div>' : `
-      <div class="grid g3">
-        <div><label for="pc">Aktuelles Passwort</label><input id="pc" type="password" autocomplete="current-password"></div>
-        <div><label for="pn">Neues Passwort (min. 10 Zeichen)</label><input id="pn" type="password" autocomplete="new-password"></div>
-        <div><label for="pn2">Neues Passwort wiederholen</label><input id="pn2" type="password" autocomplete="new-password"></div>
-      </div>
-      <div class="actions"><button class="btn" id="chPw">Passwort ändern</button></div>
-      <div id="pwStatus"></div>`}
     </div></section>
 
     <section class="card"><div class="card-h"><div><h2>Frühere Ergebnisse</h2><p>Gesamtverbrauch vergangener Zeiträume, nutzbar als Vergleichswert.</p></div></div><div class="card-b">
@@ -305,16 +289,6 @@ async function settings() {
   };
   $('#checkNow').onclick = runCheck(false);
   $('#checkSend').onclick = runCheck(true);
-  const chPw = $('#chPw');
-  if (chPw) chPw.onclick = async () => {
-    const st = $('#pwStatus');
-    if ($('#pn').value !== $('#pn2').value) { st.innerHTML = '<div class="msg err">Die neuen Passwörter stimmen nicht überein.</div>'; return; }
-    try {
-      await api('/auth/password', { method: 'POST', body: { current: $('#pc').value, password: $('#pn').value } });
-      ['#pc', '#pn', '#pn2'].forEach((i) => { $(i).value = ''; });
-      st.innerHTML = '<div class="msg ok">Passwort geändert. Andere Sitzungen wurden abgemeldet.</div>';
-    } catch (e) { st.innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
-  };
   $('#addH').onclick = async () => {
     try {
       await api('/history', { method: 'POST', body: { label: $('#hl').value, from: $('#hf').value, to: $('#ht').value, kwh: $('#hk').value } });
@@ -327,50 +301,13 @@ async function settings() {
   });
 }
 
-/* ---------------- Anmeldung ---------------- */
-function authScreen(st) {
-  clearInterval(refreshTimer);
-  const setup = st.setupRequired;
-  app.innerHTML = `
-    <div class="auth-wrap"><section class="card auth">
-      <div class="card-h"><div><h2>${setup ? 'Einrichtung' : 'Anmelden'}</h2><p>${setup ? 'Lege das Passwort für diese Oberfläche fest. Den Einrichtungscode findest du im Container-Log.' : 'Bitte melde dich an, um die Auswertung zu sehen.'}</p></div></div>
-      <form class="card-b" id="af" autocomplete="on">
-        ${setup ? '<div class="field"><label for="ac">Einrichtungscode</label><input id="ac" autocomplete="off" required></div>' : ''}
-        <div class="field"><label for="ap">Passwort${setup ? ' (min. 10 Zeichen)' : ''}</label><input id="ap" type="password" autocomplete="${setup ? 'new-password' : 'current-password'}" required></div>
-        ${setup ? '<div class="field"><label for="ap2">Passwort wiederholen</label><input id="ap2" type="password" autocomplete="new-password" required></div>' : ''}
-        <button class="btn block" type="submit">${setup ? 'Passwort festlegen' : 'Anmelden'}</button>
-        <div id="aerr"></div>
-      </form></section></div>`;
-  $('#af').onsubmit = async (ev) => {
-    ev.preventDefault();
-    const err = $('#aerr');
-    if (setup && $('#ap').value !== $('#ap2').value) { err.innerHTML = '<div class="msg err">Die Passwörter stimmen nicht überein.</div>'; return; }
-    try {
-      const r = await api(setup ? '/auth/setup' : '/auth/login', { method: 'POST', body: setup ? { code: $('#ac').value, password: $('#ap').value } : { password: $('#ap').value } });
-      csrf = r.csrf; route();
-    } catch (e) { err.innerHTML = `<div class="msg err">${esc(e.message)}</div>`; $('#ap').value = ''; }
-  };
-  ($('#ac') || $('#ap')).focus();
-}
-
 /* ---------------- Router ---------------- */
 async function route() {
   clearInterval(refreshTimer);
-  try {
-    const st = await api('/auth/state');
-    document.body.classList.toggle('anon', !st.authenticated);
-    if (!st.authenticated) { csrf = null; return authScreen(st); }
-    csrf = st.csrf;
-    const page = location.hash.startsWith('#/settings') ? 'settings' : 'dash';
-    document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('on', a.dataset.nav === page));
-    await (page === 'settings' ? settings() : dashboard());
-  } catch (e) {
-    if (e instanceof AuthError) return route();
-    app.innerHTML = `<div class="msg err">${esc(e.message)}</div>`;
-  }
+  const page = location.hash.startsWith('#/settings') ? 'settings' : 'dash';
+  document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('on', a.dataset.nav === page));
+  try { await (page === 'settings' ? settings() : dashboard()); }
+  catch (e) { app.innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
 }
-$('#logout').onclick = async () => { try { await api('/auth/logout', { method: 'POST' }); } catch { /* ignore */ } csrf = null; route(); };
 addEventListener('hashchange', route);
-// abgelaufene Sitzung bei Klicks/Hintergrundaktionen: zurück zur Anmeldung statt Fehlermeldung
-addEventListener('unhandledrejection', (ev) => { if (ev.reason instanceof AuthError) { ev.preventDefault(); route(); } });
 route();
